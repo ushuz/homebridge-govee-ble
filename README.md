@@ -1,4 +1,4 @@
-# homebridge-govee-ble
+# @ushuz/homebridge-govee-ble
 
 Local-only Homebridge control for the Govee H61E0 LED strip over BLE. The
 plugin exposes power, brightness, hue, saturation, and color temperature. It
@@ -47,41 +47,22 @@ command. BLE supports only one active connection to this device.
 
 ## Install
 
-The recommended method is the Homebridge UI:
-
-- Open **Plugins**
-- Search for `homebridge-govee-ble`
-- Select **Install**
-
-For the official Homebridge Raspberry Pi service installation, use:
-
 ```sh
-sudo hb-service add homebridge-govee-ble
+hb-service add @ushuz/homebridge-govee-ble
+# or
+npm install -g @ushuz/homebridge-govee-ble
 ```
 
-This installs the plugin into Homebridge's managed Node.js environment. Do not
-run a separate global `npm install` when using `hb-service`.
+Restart Homebridge after install.
 
-If Homebridge was installed globally with npm instead of `hb-service`, install
-the plugin from npm using the same Node.js installation:
-
-```sh
-sudo npm install -g homebridge-govee-ble
-```
-
-Restart Homebridge after installation:
-
-```sh
-sudo hb-service restart
-```
-
-To work on the plugin from source, clone the repository and use `npm link`:
+To work on the plugin from source:
 
 ```sh
 git clone https://github.com/ushuz/homebridge-govee-ble.git
 cd homebridge-govee-ble
 npm install
-npm link
+npm test
+npm run build
 ```
 
 ## Configure
