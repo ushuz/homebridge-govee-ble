@@ -1,7 +1,7 @@
 import type { Logger } from "homebridge"
 import type { Characteristic, Noble, Peripheral } from "@stoprocent/noble"
 
-import { GOVEE_WRITE_UUID } from "./settings"
+import { GOVEE_SERVICE_UUID, GOVEE_WRITE_UUID } from "./settings"
 
 interface BleControllerOptions {
   scanTimeout: number
@@ -16,9 +16,14 @@ interface DiscoveredGoveeDevice {
 }
 
 const DISCONNECT_TIMEOUT = 2000
+const CONNECTION_SETTLE_DELAY = 300
+const RETRY_DELAY = 500
 
 export class BleController {
   private readonly noble: Noble
+  private readonly peripherals = new Map<string, Peripheral>()
+  private readonly characteristics = new WeakMap<Peripheral, Characteristic>()
+  private readonly watchedPeripherals = new WeakSet<Peripheral>()
   private queue: Promise<void> = Promise.resolve()
 
   constructor(
@@ -27,6 +32,11 @@ export class BleController {
     nobleClient?: Noble,
   ) {
     this.noble = nobleClient ?? require("@stoprocent/noble") as Noble
+    this.noble.on("stateChange", state => {
+      if (state !== "poweredOn") {
+        this.peripherals.clear()
+      }
+    })
   }
 
   send(address: string, frame: Buffer): Promise<void> {
@@ -55,7 +65,9 @@ export class BleController {
       }
 
       const address = peripheral.address || peripheral.id
-      devices.set(normalizeAddress(address), {
+      const normalizedAddress = normalizeAddress(address)
+      this.rememberPeripheral(normalizedAddress, peripheral)
+      devices.set(normalizedAddress, {
         name,
         address,
         rssi: peripheral.rssi,
@@ -89,9 +101,10 @@ export class BleController {
         return
       } catch (error) {
         lastError = error
+        await this.resetPeripheral(this.peripherals.get(address))
         if (attempt < this.options.commandRetries) {
           this.log.debug("BLE command to %s failed, retrying: %s", address, errorMessage(error))
-          await delay(250)
+          await delay(RETRY_DELAY)
         }
       }
     }
@@ -102,25 +115,18 @@ export class BleController {
   private async sendOnce(address: string, frame: Buffer): Promise<void> {
     await this.waitForPoweredOn()
 
-    let peripheral: Peripheral | undefined
-    try {
-      peripheral = await this.findPeripheral(address)
-      if (peripheral.state !== "connected") {
-        await withTimeout(
-          peripheral.connectAsync(),
-          this.options.connectTimeout,
-          `timed out connecting to ${address}`,
-        )
-      }
+    const peripheral = await this.findPeripheral(address)
+    await this.ensureConnected(peripheral, address)
 
-      const characteristic = await this.findWriteCharacteristic(peripheral)
-      this.log.debug("sending BLE frame to %s: %s", address, frame.toString("hex"))
-      await withTimeout(characteristic.writeAsync(frame, true), 5000, `timed out writing to ${address}`)
-      await delay(100)
-    } finally {
-      await this.stopScanning()
-      await this.cleanupPeripheral(peripheral)
+    let characteristic = this.characteristics.get(peripheral)
+    if (!characteristic) {
+      characteristic = await this.findWriteCharacteristic(peripheral)
+      this.characteristics.set(peripheral, characteristic)
     }
+
+    this.log.debug("sending BLE frame to %s: %s", address, frame.toString("hex"))
+    await withTimeout(characteristic.writeAsync(frame, true), 5000, `timed out writing to ${address}`)
+    await delay(100)
   }
 
   private async waitForPoweredOn(): Promise<void> {
@@ -136,6 +142,11 @@ export class BleController {
   }
 
   private async findPeripheral(address: string): Promise<Peripheral> {
+    const cached = this.peripherals.get(address)
+    if (cached) {
+      return cached
+    }
+
     let onDiscover: ((candidate: Peripheral) => void) | undefined
     const peripheralPromise = new Promise<Peripheral>((resolve) => {
       onDiscover = (candidate: Peripheral) => {
@@ -144,8 +155,9 @@ export class BleController {
           candidate.address,
           candidate.advertisement.localName ?? "unnamed",
         )
-        if (normalizeAddress(candidate.address) === address) {
+        if (normalizeAddress(candidate.address || candidate.id) === address) {
           this.noble.removeListener("discover", onDiscover!)
+          this.rememberPeripheral(address, candidate)
           resolve(candidate)
         }
       }
@@ -168,8 +180,19 @@ export class BleController {
   }
 
   private async findWriteCharacteristic(peripheral: Peripheral): Promise<Characteristic> {
-    const { characteristics } = await withTimeout(
-      peripheral.discoverAllServicesAndCharacteristicsAsync(),
+    const services = await withTimeout(
+      peripheral.discoverServicesAsync([]),
+      this.options.connectTimeout,
+      `timed out discovering Govee services on ${peripheral.address}`,
+    )
+    const service = services.find(candidate => normalizeUuid(candidate.uuid) === GOVEE_SERVICE_UUID)
+    if (!service) {
+      const discoveredUuids = services.map(candidate => candidate.uuid).join(", ") || "none"
+      throw new Error(`Govee service not found on ${peripheral.address}; discovered ${discoveredUuids}`)
+    }
+
+    const characteristics = await withTimeout(
+      service.discoverCharacteristicsAsync([GOVEE_WRITE_UUID]),
       this.options.connectTimeout,
       `timed out discovering Govee control characteristic on ${peripheral.address}`,
     )
@@ -184,12 +207,62 @@ export class BleController {
     await this.noble.stopScanningAsync().catch(() => undefined)
   }
 
-  private async cleanupPeripheral(peripheral?: Peripheral): Promise<void> {
-    if (peripheral?.state === "connecting") {
-      peripheral.cancelConnect()
+  private rememberPeripheral(address: string, peripheral: Peripheral): void {
+    this.peripherals.set(address, peripheral)
+    if (this.watchedPeripherals.has(peripheral)) {
       return
     }
-    if (peripheral?.state !== "connected") {
+
+    this.watchedPeripherals.add(peripheral)
+    peripheral.on("disconnect", reason => {
+      this.characteristics.delete(peripheral)
+      this.log.debug("BLE peripheral %s disconnected: %s", address, reason)
+    })
+  }
+
+  private async ensureConnected(peripheral: Peripheral, address: string): Promise<void> {
+    const current = (): string => peripheral.state
+
+    if (current() === "connecting" || current() === "disconnecting") {
+      await this.waitForConnectionTransition(peripheral)
+    }
+    if (current() === "connected") {
+      return
+    }
+
+    await withTimeout(
+      peripheral.connectAsync(),
+      this.options.connectTimeout,
+      `timed out connecting to ${address}`,
+    )
+    await delay(CONNECTION_SETTLE_DELAY)
+    if (current() !== "connected") {
+      throw new Error(`Govee strip ${address} disconnected while establishing the BLE session`)
+    }
+  }
+
+  private async resetPeripheral(peripheral?: Peripheral): Promise<void> {
+    if (!peripheral) {
+      return
+    }
+
+    this.characteristics.delete(peripheral)
+    if (peripheral.state === "connecting") {
+      peripheral.cancelConnect()
+      if (peripheral.state === "connecting") {
+        await this.waitForConnectionTransition(peripheral).catch(error => {
+          this.log.debug("BLE connection reset failed: %s", errorMessage(error))
+        })
+      }
+      return
+    }
+    if (peripheral.state === "disconnecting") {
+      await this.waitForConnectionTransition(peripheral).catch(error => {
+        this.log.debug("BLE connection reset failed: %s", errorMessage(error))
+      })
+      return
+    }
+    if (peripheral.state !== "connected") {
       return
     }
 
@@ -197,7 +270,27 @@ export class BleController {
       peripheral.disconnectAsync(),
       DISCONNECT_TIMEOUT,
       `timed out disconnecting from ${peripheral.address}`,
-    ).catch(error => this.log.debug("BLE cleanup failed: %s", errorMessage(error)))
+    ).catch(error => this.log.debug("BLE connection reset failed: %s", errorMessage(error)))
+  }
+
+  private async waitForConnectionTransition(peripheral: Peripheral): Promise<void> {
+    let onTransition: (() => void) | undefined
+    const transition = new Promise<void>((resolve) => {
+      onTransition = resolve
+      peripheral.once("connect", onTransition)
+      peripheral.once("disconnect", onTransition)
+    })
+
+    try {
+      await withTimeout(
+        transition,
+        DISCONNECT_TIMEOUT,
+        `timed out waiting for BLE connection state ${peripheral.state} on ${peripheral.address}`,
+      )
+    } finally {
+      peripheral.removeListener("connect", onTransition!)
+      peripheral.removeListener("disconnect", onTransition!)
+    }
   }
 }
 

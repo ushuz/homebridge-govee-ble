@@ -42,8 +42,10 @@ bluetoothctl scan on
 Look for a device named like `Govee_H61E0_XXXX`. Copy its colon-separated BLE
 address, then stop the scan with `bluetoothctl scan off`.
 
-The Govee app must not be connected to the strip while Homebridge sends a
-command. BLE supports only one active connection to this device.
+Close the Govee app before using the plugin. After the first successful
+command, the plugin keeps the BLE session open to avoid repeated connection
+setup on Raspberry Pi. The app cannot connect until Homebridge stops or the
+BLE session drops.
 
 The plugin also scans at startup and logs each nearby H61E0:
 
@@ -105,6 +107,9 @@ the system's selected Bluetooth adapter.
 
 - BLE operations are serialized so simultaneous HomeKit changes cannot compete
   for the Raspberry Pi's single adapter.
+- A successful connection and control characteristic are reused until the strip
+  disconnects. The plugin then reconnects and discovers the characteristic
+  again.
 - H61E0 does not provide reliable state reads through this protocol. Homebridge
   therefore reports the last state it successfully sent. Changes made with the
   Govee app or inline controller are not reflected until Homebridge sends a new
@@ -125,6 +130,9 @@ homebridge -D
 - `Bluetooth adapter is unauthorized`: verify `getcap "$(command -v node)"`
 - `Bluetooth adapter is poweredOff`: run `sudo rfkill unblock bluetooth`
 - `could not find Govee strip`: verify the address and close the Govee app
+- `Disconnected 19` or `Disconnected 62`: close the Govee app and stop other
+  processes that may be connecting to the strip, then verify the strip remains
+  within reliable BLE range
 - native module installation failure: ensure `build-essential`, `python3`,
   `libbluetooth-dev`, and `libudev-dev` are installed
 
