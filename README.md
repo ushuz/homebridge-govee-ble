@@ -47,16 +47,42 @@ command. BLE supports only one active connection to this device.
 
 ## Install
 
-From this project directory:
+The recommended method is the Homebridge UI:
+
+- Open **Plugins**
+- Search for `homebridge-govee-ble`
+- Select **Install**
+
+For the official Homebridge Raspberry Pi service installation, use:
 
 ```sh
-npm install
-npm run build
-sudo npm link
+sudo hb-service add homebridge-govee-ble
 ```
 
-For a standard Homebridge service install, link the plugin from the same Node.js
-installation that runs Homebridge.
+This installs the plugin into Homebridge's managed Node.js environment. Do not
+run a separate global `npm install` when using `hb-service`.
+
+If Homebridge was installed globally with npm instead of `hb-service`, install
+the plugin from npm using the same Node.js installation:
+
+```sh
+sudo npm install -g homebridge-govee-ble
+```
+
+Restart Homebridge after installation:
+
+```sh
+sudo hb-service restart
+```
+
+To work on the plugin from source, clone the repository and use `npm link`:
+
+```sh
+git clone https://github.com/ushuz/homebridge-govee-ble.git
+cd homebridge-govee-ble
+npm install
+npm link
+```
 
 ## Configure
 
