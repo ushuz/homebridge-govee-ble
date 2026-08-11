@@ -1,0 +1,83 @@
+{
+  "pluginAlias": "GoveeBLE",
+  "pluginType": "platform",
+  "singular": true,
+  "strictValidation": true,
+  "schema": {
+    "type": "object",
+    "required": [
+      "devices"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "title": "Platform name",
+        "type": "string",
+        "default": "Govee BLE"
+      },
+      "devices": {
+        "title": "LED strips",
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "required": [
+            "name",
+            "address"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "title": "Name",
+              "type": "string",
+              "default": "Govee LED Strip"
+            },
+            "address": {
+              "title": "BLE address",
+              "type": "string",
+              "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$",
+              "placeholder": "aa:bb:cc:dd:ee:ff"
+            },
+            "model": {
+              "title": "Model",
+              "type": "string",
+              "default": "H61E0",
+              "enum": [
+                "H61E0"
+              ]
+            }
+          }
+        }
+      },
+      "hciDeviceId": {
+        "title": "Bluetooth adapter ID",
+        "type": "integer",
+        "minimum": 0,
+        "default": 0
+      },
+      "scanTimeout": {
+        "title": "Scan timeout",
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 30,
+        "default": 10,
+        "description": "Seconds to wait for the strip to advertise"
+      },
+      "connectTimeout": {
+        "title": "Connection timeout",
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 30,
+        "default": 10,
+        "description": "Seconds to wait for a BLE connection"
+      },
+      "commandRetries": {
+        "title": "Command retries",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 3,
+        "default": 1
+      }
+    }
+  }
+}

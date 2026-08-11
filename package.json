@@ -1,0 +1,42 @@
+{
+  "name": "homebridge-govee-ble",
+  "version": "0.1.0",
+  "description": "Homebridge plugin for local BLE control of Govee H61E0 LED strips",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "config.schema.json",
+    "lib"
+  ],
+  "engines": {
+    "homebridge": "^1.8.5",
+    "node": "^20.18.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf lib",
+    "lint": "tsc --noEmit",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.js"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "govee",
+    "ble",
+    "bluetooth",
+    "h61e0"
+  ],
+  "dependencies": {
+    "@stoprocent/noble": "2.7.1"
+  },
+  "optionalDependencies": {
+    "@stoprocent/bluetooth-hci-socket": "2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.19",
+    "homebridge": "1.8.5",
+    "rimraf": "6.0.1",
+    "typescript": "5.7.3"
+  }
+}
