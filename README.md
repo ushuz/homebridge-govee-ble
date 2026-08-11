@@ -45,6 +45,17 @@ address, then stop the scan with `bluetoothctl scan off`.
 The Govee app must not be connected to the strip while Homebridge sends a
 command. BLE supports only one active connection to this device.
 
+The plugin also scans at startup and logs each nearby H61E0:
+
+```text
+Scanning for Govee H61E0 devices (10s)...
+Discovered 1 Govee H61E0 device(s)
+  - Govee_H61E0_0C6A address=aa:bb:cc:dd:ee:ff rssi=-57
+```
+
+You can initially configure `"devices": []`, restart Homebridge, and copy the
+address from this log before adding the device configuration.
+
 ## Install
 
 ```sh

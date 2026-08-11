@@ -9,6 +9,12 @@ interface BleControllerOptions {
   commandRetries: number
 }
 
+interface DiscoveredGoveeDevice {
+  name: string
+  address: string
+  rssi: number
+}
+
 const DISCONNECT_TIMEOUT = 2000
 
 export class BleController {
@@ -25,9 +31,53 @@ export class BleController {
 
   send(address: string, frame: Buffer): Promise<void> {
     const normalizedAddress = normalizeAddress(address)
-    const operation = this.queue.then(() => this.sendWithRetries(normalizedAddress, frame))
-    this.queue = operation.catch(() => undefined)
-    return operation
+    return this.enqueue(() => this.sendWithRetries(normalizedAddress, frame))
+  }
+
+  discoverGoveeDevices(): Promise<void> {
+    return this.enqueue(() => this.scanForGoveeDevices())
+  }
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    const queued = this.queue.then(operation)
+    this.queue = queued.catch(() => undefined)
+    return queued
+  }
+
+  private async scanForGoveeDevices(): Promise<void> {
+    await this.waitForPoweredOn()
+
+    const devices = new Map<string, DiscoveredGoveeDevice>()
+    const onDiscover = (peripheral: Peripheral) => {
+      const name = peripheral.advertisement.localName ?? ""
+      if (!/^govee_h61e0(?:_|$)/i.test(name)) {
+        return
+      }
+
+      const address = peripheral.address || peripheral.id
+      devices.set(normalizeAddress(address), {
+        name,
+        address,
+        rssi: peripheral.rssi,
+      })
+    }
+
+    const durationSeconds = this.options.scanTimeout / 1000
+    this.log.info("Scanning for Govee H61E0 devices (%ss)...", durationSeconds)
+    this.noble.on("discover", onDiscover)
+    try {
+      await this.noble.startScanningAsync([], true)
+      await delay(this.options.scanTimeout)
+    } finally {
+      this.noble.removeListener("discover", onDiscover)
+      await this.stopScanning()
+    }
+
+    const discovered = [...devices.values()]
+    this.log.info("Discovered %s Govee H61E0 device(s)", discovered.length)
+    for (const device of discovered) {
+      this.log.info("  - %s address=%s rssi=%s", device.name, device.address, device.rssi)
+    }
   }
 
   private async sendWithRetries(address: string, frame: Buffer): Promise<void> {

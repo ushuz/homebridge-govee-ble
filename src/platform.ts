@@ -37,7 +37,11 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
       commandRetries: config.commandRetries ?? 1,
     })
 
-    api.on("didFinishLaunching", () => this.discoverDevices())
+    api.on("didFinishLaunching", () => {
+      this.discoverDevices()
+      void this.ble.discoverGoveeDevices()
+        .catch(error => this.log.warn("Govee BLE discovery failed: %s", errorMessage(error)))
+    })
   }
 
   configureAccessory(accessory: PlatformAccessory<GoveeAccessoryContext>): void {
@@ -100,4 +104,8 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
     }
     return true
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

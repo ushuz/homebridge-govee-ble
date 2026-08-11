@@ -61,6 +61,59 @@ it("finds, writes to, and disconnects from the configured strip", async () => {
   assert.equal(writtenFrames[0].withoutResponse, true)
 })
 
+it("logs unique H61E0 devices found during discovery", async () => {
+  const noble = Object.assign(new EventEmitter(), {
+    state: "poweredOn",
+    async waitForPoweredOnAsync() {},
+    async startScanningAsync() {
+      setImmediate(() => {
+        noble.emit("discover", {
+          id: "govee-id",
+          address: "aa:bb:cc:dd:ee:ff",
+          rssi: -57,
+          advertisement: { localName: "Govee_H61E0_0C6A" },
+        })
+        noble.emit("discover", {
+          id: "govee-id",
+          address: "aa:bb:cc:dd:ee:ff",
+          rssi: -55,
+          advertisement: { localName: "Govee_H61E0_0C6A" },
+        })
+        noble.emit("discover", {
+          id: "other-id",
+          address: "11:22:33:44:55:66",
+          rssi: -40,
+          advertisement: { localName: "Other_Device" },
+        })
+      })
+    },
+    async stopScanningAsync() {},
+  })
+  const logs = []
+  const log = {
+    debug() {},
+    info(message, ...parameters) {
+      logs.push({ message, parameters })
+    },
+  }
+  const controller = new BleController(log, {
+    scanTimeout: 20,
+    connectTimeout: 100,
+    commandRetries: 0,
+  }, noble)
+
+  await controller.discoverGoveeDevices()
+
+  assert.deepEqual(logs.at(-2), {
+    message: "Discovered %s Govee H61E0 device(s)",
+    parameters: [1],
+  })
+  assert.deepEqual(logs.at(-1), {
+    message: "  - %s address=%s rssi=%s",
+    parameters: ["Govee_H61E0_0C6A", "aa:bb:cc:dd:ee:ff", -55],
+  })
+})
+
 it("cancels a timed-out connection without blocking the next command", async () => {
   const address = "aa:bb:cc:dd:ee:ff"
   let scanCount = 0
