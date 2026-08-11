@@ -1,6 +1,6 @@
 {
   "name": "homebridge-govee-ble",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Homebridge plugin for local BLE control of Govee H61E0 LED strips",
   "license": "MIT",
   "main": "lib/index.js",
