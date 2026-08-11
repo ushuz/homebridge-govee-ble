@@ -23,7 +23,7 @@ it("finds, writes to, and disconnects from the configured strip", async () => {
       disconnected = true
       this.state = "disconnected"
     },
-    async discoverSomeServicesAndCharacteristicsAsync() {
+    async discoverAllServicesAndCharacteristicsAsync() {
       return {
         services: [],
         characteristics: [{
@@ -59,6 +59,52 @@ it("finds, writes to, and disconnects from the configured strip", async () => {
   assert.equal(writtenFrames.length, 1)
   assert.equal(writtenFrames[0].frame.toString("hex"), frame.toString("hex"))
   assert.equal(writtenFrames[0].withoutResponse, true)
+})
+
+it("reuses an existing connection instead of reconnecting", async () => {
+  const address = "aa:bb:cc:dd:ee:ff"
+  let connectCalled = false
+  let written = false
+  const peripheral = {
+    address,
+    state: "connected",
+    advertisement: { localName: "Govee_H61E0_EEFF" },
+    async connectAsync() {
+      connectCalled = true
+    },
+    async disconnectAsync() {
+      this.state = "disconnected"
+    },
+    async discoverAllServicesAndCharacteristicsAsync() {
+      return {
+        services: [],
+        characteristics: [{
+          uuid: "000102030405060708090a0b0c0d2b11",
+          async writeAsync() {
+            written = true
+          },
+        }],
+      }
+    },
+  }
+  const noble = Object.assign(new EventEmitter(), {
+    state: "poweredOn",
+    async waitForPoweredOnAsync() {},
+    async startScanningAsync() {
+      setImmediate(() => noble.emit("discover", peripheral))
+    },
+    async stopScanningAsync() {},
+  })
+  const controller = new BleController({ debug() {} }, {
+    scanTimeout: 100,
+    connectTimeout: 100,
+    commandRetries: 0,
+  }, noble)
+
+  await controller.send(address, createPowerFrame(true))
+
+  assert.equal(connectCalled, false)
+  assert.equal(written, true)
 })
 
 it("logs unique H61E0 devices found during discovery", async () => {
@@ -146,7 +192,7 @@ it("cancels a timed-out connection without blocking the next command", async () 
     async disconnectAsync() {
       this.state = "disconnected"
     },
-    async discoverSomeServicesAndCharacteristicsAsync() {
+    async discoverAllServicesAndCharacteristicsAsync() {
       return {
         services: [],
         characteristics: [{

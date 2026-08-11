@@ -1,7 +1,7 @@
 import type { Logger } from "homebridge"
 import type { Characteristic, Noble, Peripheral } from "@stoprocent/noble"
 
-import { GOVEE_SERVICE_UUID, GOVEE_WRITE_UUID } from "./settings"
+import { GOVEE_WRITE_UUID } from "./settings"
 
 interface BleControllerOptions {
   scanTimeout: number
@@ -105,11 +105,13 @@ export class BleController {
     let peripheral: Peripheral | undefined
     try {
       peripheral = await this.findPeripheral(address)
-      await withTimeout(
-        peripheral.connectAsync(),
-        this.options.connectTimeout,
-        `timed out connecting to ${address}`,
-      )
+      if (peripheral.state !== "connected") {
+        await withTimeout(
+          peripheral.connectAsync(),
+          this.options.connectTimeout,
+          `timed out connecting to ${address}`,
+        )
+      }
 
       const characteristic = await this.findWriteCharacteristic(peripheral)
       this.log.debug("sending BLE frame to %s: %s", address, frame.toString("hex"))
@@ -167,10 +169,7 @@ export class BleController {
 
   private async findWriteCharacteristic(peripheral: Peripheral): Promise<Characteristic> {
     const { characteristics } = await withTimeout(
-      peripheral.discoverSomeServicesAndCharacteristicsAsync(
-        [GOVEE_SERVICE_UUID],
-        [GOVEE_WRITE_UUID],
-      ),
+      peripheral.discoverAllServicesAndCharacteristicsAsync(),
       this.options.connectTimeout,
       `timed out discovering Govee control characteristic on ${peripheral.address}`,
     )
