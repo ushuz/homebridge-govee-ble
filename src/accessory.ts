@@ -96,6 +96,7 @@ export class GoveeLightAccessory {
   }
 
   private async setColorTemperature(value: CharacteristicValue): Promise<void> {
+    this.cancelColorUpdate()
     const [red, green, blue] = colorTemperatureToRgb(Number(value))
     await this.send(createColorFrame(red, green, blue))
     this.colorTemperature = Number(value)
@@ -130,6 +131,16 @@ export class GoveeLightAccessory {
       for (const waiter of waiters) {
         waiter.reject(error)
       }
+    }
+  }
+
+  private cancelColorUpdate(): void {
+    clearTimeout(this.colorTimer)
+    this.colorTimer = undefined
+    this.targetHue = this.hue
+    this.targetSaturation = this.saturation
+    for (const waiter of this.colorWaiters.splice(0)) {
+      waiter.resolve()
     }
   }
 

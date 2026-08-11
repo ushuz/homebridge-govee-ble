@@ -9,6 +9,8 @@ interface BleControllerOptions {
   commandRetries: number
 }
 
+const DISCONNECT_TIMEOUT = 2000
+
 export class BleController {
   private readonly noble: Noble
   private queue: Promise<void> = Promise.resolve()
@@ -65,9 +67,7 @@ export class BleController {
       await delay(100)
     } finally {
       await this.stopScanning()
-      if (peripheral) {
-        await peripheral.disconnectAsync().catch(() => undefined)
-      }
+      await this.cleanupPeripheral(peripheral)
     }
   }
 
@@ -133,6 +133,22 @@ export class BleController {
 
   private async stopScanning(): Promise<void> {
     await this.noble.stopScanningAsync().catch(() => undefined)
+  }
+
+  private async cleanupPeripheral(peripheral?: Peripheral): Promise<void> {
+    if (peripheral?.state === "connecting") {
+      peripheral.cancelConnect()
+      return
+    }
+    if (peripheral?.state !== "connected") {
+      return
+    }
+
+    await withTimeout(
+      peripheral.disconnectAsync(),
+      DISCONNECT_TIMEOUT,
+      `timed out disconnecting from ${peripheral.address}`,
+    ).catch(error => this.log.debug("BLE cleanup failed: %s", errorMessage(error)))
   }
 }
 
