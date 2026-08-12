@@ -173,16 +173,70 @@ export function formatBleAddress(address: string): string {
   return normalizeBleAddress(address).toUpperCase()
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 /**
- * start discovery if not already running (another client may own it).
+ * ensure le discovery is running.
+ * bluez discovery is owned by the dbus client that started it. try stop (only
+ * works if we own the session), then start; on "already in progress" piggyback.
+ * if start still fails, power-cycle the adapter to clear a stuck session.
  * returns whether this call started discovery (caller should stop only if true).
  */
 export async function ensureDiscovery(adapter: NodeBleAdapter): Promise<boolean> {
-  if (await adapter.isDiscovering()) {
+  try {
+    if (await adapter.isDiscovering()) {
+      try {
+        await adapter.stopDiscovery()
+        await sleep(150)
+      } catch {
+        // another client owns the session — piggyback below
+      }
+    }
+  } catch {
+    // ignore property read errors
+  }
+
+  if (await adapter.isDiscovering().catch(() => false)) {
     return false
   }
-  await adapter.startDiscovery()
-  return true
+
+  try {
+    await adapter.startDiscovery()
+    return true
+  } catch (err) {
+    const msg = String((err as Error)?.message || err)
+    if (/already in progress/i.test(msg)) {
+      return false
+    }
+    try {
+      await powerCycleAdapter(adapter)
+      await adapter.startDiscovery()
+      return true
+    } catch {
+      throw err
+    }
+  }
+}
+
+/** power-cycle adapter via node-ble BusHelper (clears stuck Discovering) */
+async function powerCycleAdapter(adapter: NodeBleAdapter): Promise<void> {
+  const anyAdapter = adapter as unknown as {
+    helper?: { set: (prop: string, value: unknown) => Promise<void> }
+  }
+  if (!anyAdapter.helper?.set) {
+    return
+  }
+  // dbus-next Variant — same shape node-ble buildTypedValue uses
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { Variant } = require("dbus-next") as {
+    Variant: new (sig: string, value: unknown) => unknown
+  }
+  await anyAdapter.helper.set("Powered", new Variant("b", false))
+  await sleep(300)
+  await anyAdapter.helper.set("Powered", new Variant("b", true))
+  await sleep(400)
 }
 
 export async function stopDiscoveryIfStarted(

@@ -59,7 +59,10 @@ export class BleController {
   }
 
   discoverGoveeDevices(): Promise<void> {
-    return this.enqueue(() => this.scanForGoveeDevices())
+    // serialize with other work, but lock only the radio window inside scan
+    const queued = this.queue.then(() => this.scanForGoveeDevices())
+    this.queue = queued.catch(() => undefined)
+    return queued
   }
 
   /** disconnect retained sessions and close the dbus bus (homebridge shutdown) */
@@ -104,10 +107,12 @@ export class BleController {
     return queued
   }
 
-  private withAdapterLock(operation: () => Promise<void>): Promise<void> {
+  private withAdapterLock<T>(operation: () => Promise<T>): Promise<T> {
+    // peer airthings scans are short; dbus property walks happen outside the lock.
+    // keep headroom for pi zero contention.
     const acquireTimeoutMs = Math.max(
-      120_000,
-      this.options.scanTimeout + this.options.connectTimeout + 60_000,
+      180_000,
+      this.options.scanTimeout + this.options.connectTimeout + 90_000,
     )
     return withBleAdapterLock(
       {
@@ -141,36 +146,43 @@ export class BleController {
     const durationSeconds = this.options.scanTimeout / 1000
     this.log.info("Scanning for Govee H61E0 devices (%ss)...", durationSeconds)
 
-    const startedHere = await ensureDiscovery(adapter)
-    try {
-      await delay(this.options.scanTimeout)
-      const addresses = await adapter.devices()
-      for (const address of addresses) {
-        try {
-          const device = await adapter.getDevice(address)
-          // name or alias — bluez may only set one; do not require rssi
-          // (rssi is often cleared between advertisements on pi)
-          const name = (await device.getName().catch(() => null))
-            || (await device.getAlias().catch(() => null))
-            || ""
-          if (!/^govee_h61e0(?:_|$)/i.test(name)) {
-            continue
-          }
-          const normalized = normalizeBleAddress(address)
-          this.rememberDevice(normalized, device)
-          const rssiRaw = await device.getRSSI().catch(() => 0)
-          devices.set(normalized, {
-            name: name || "Govee_H61E0",
-            address: normalized,
-            rssi: Number(rssiRaw) || 0,
+    // inspect while discovery is active — name/mfg props often vanish after stop
+    await this.withAdapterLock(async () => {
+      const startedHere = await ensureDiscovery(adapter)
+      try {
+        const deadline = Date.now() + this.options.scanTimeout
+        while (Date.now() < deadline) {
+          const addresses = await adapter.devices()
+          await mapPool(addresses, 6, async (address) => {
+            try {
+              const device = await adapter.getDevice(address)
+              const name = (await device.getName().catch(() => null))
+                || (await device.getAlias().catch(() => null))
+                || ""
+              if (!/^govee_h61e0(?:_|$)/i.test(name)) {
+                return
+              }
+              const normalized = normalizeBleAddress(address)
+              this.rememberDevice(normalized, device)
+              const rssiRaw = await device.getRSSI().catch(() => 0)
+              devices.set(normalized, {
+                name: name || "Govee_H61E0",
+                address: normalized,
+                rssi: Number(rssiRaw) || 0,
+              })
+            } catch {
+              // device may disappear mid-scan
+            }
           })
-        } catch {
-          // device may disappear mid-scan
+          if (devices.size > 0) {
+            break
+          }
+          await delay(1000)
         }
+      } finally {
+        await stopDiscoveryIfStarted(adapter, startedHere)
       }
-    } finally {
-      await stopDiscoveryIfStarted(adapter, startedHere)
-    }
+    })
 
     const discovered = [...devices.values()]
     this.log.info("Discovered %s Govee H61E0 device(s)", discovered.length)
@@ -234,18 +246,21 @@ export class BleController {
       // fall through to discovery wait
     }
 
-    const startedHere = await ensureDiscovery(adapter)
-    try {
-      const device = await withTimeout(
-        adapter.waitDevice(formatted, this.options.scanTimeout, 250),
-        this.options.scanTimeout + 1000,
-        `could not find Govee strip ${address}`,
-      )
-      this.rememberDevice(address, device)
-      return device
-    } finally {
-      await stopDiscoveryIfStarted(adapter, startedHere)
-    }
+    // waitDevice needs discovery running; hold the shared radio lock for it
+    return this.withAdapterLock(async () => {
+      const startedHere = await ensureDiscovery(adapter)
+      try {
+        const device = await withTimeout(
+          adapter.waitDevice(formatted, this.options.scanTimeout, 250),
+          this.options.scanTimeout + 1000,
+          `could not find Govee strip ${address}`,
+        )
+        this.rememberDevice(address, device)
+        return device
+      } finally {
+        await stopDiscoveryIfStarted(adapter, startedHere)
+      }
+    })
   }
 
   private async findWriteCharacteristic(device: NodeBleDevice): Promise<NodeBleGattCharacteristic> {
@@ -393,3 +408,24 @@ async function withTimeout<T>(promise: Promise<T>, milliseconds: number, message
     clearTimeout(timeout)
   }
 }
+
+/** run async work over items with a concurrency limit */
+async function mapPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) {
+    return
+  }
+  const limit = Math.max(1, concurrency)
+  let index = 0
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (index < items.length) {
+      const i = index++
+      await worker(items[i])
+    }
+  })
+  await Promise.all(runners)
+}
+
