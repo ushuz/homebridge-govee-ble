@@ -148,17 +148,12 @@ export class BleController {
       for (const address of addresses) {
         try {
           const device = await adapter.getDevice(address)
-          // bluez retains stale Device1 nodes; rssi only while advertising
-          try {
-            const rssi = await device.getRSSI()
-            if (rssi === null || rssi === undefined || String(rssi) === "") {
-              continue
-            }
-          } catch {
-            continue
-          }
-          const name = await device.getName().catch(async () => device.getAlias().catch(() => ""))
-          if (!/^govee_h61e0(?:_|$)/i.test(name || "")) {
+          // name or alias — bluez may only set one; do not require rssi
+          // (rssi is often cleared between advertisements on pi)
+          const name = (await device.getName().catch(() => null))
+            || (await device.getAlias().catch(() => null))
+            || ""
+          if (!/^govee_h61e0(?:_|$)/i.test(name)) {
             continue
           }
           const normalized = normalizeBleAddress(address)
