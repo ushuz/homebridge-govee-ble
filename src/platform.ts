@@ -8,6 +8,7 @@ import type {
 } from "homebridge"
 
 import { GoveeLightAccessory } from "./accessory"
+import { resolveHciDeviceId } from "./ble/adapterLock"
 import { BleController } from "./ble-controller"
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings"
 import type { DeviceConfig, GoveeAccessoryContext, GoveePlatformConfig } from "./types"
@@ -28,19 +29,24 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
     this.Service = api.hap.Service
     this.Characteristic = api.hap.Characteristic
 
-    process.env.NOBLE_HCI_DEVICE_ID = String(config.hciDeviceId ?? 0)
-    process.env.NOBLE_REPORT_ALL_HCI_EVENTS = "1"
+    // explicit config wins; else NOBLE_HCI_DEVICE_ID env (legacy); else 0
+    const hciDeviceId = resolveHciDeviceId(config.hciDeviceId)
 
     this.ble = new BleController(log, {
       scanTimeout: (config.scanTimeout ?? 10) * 1000,
       connectTimeout: (config.connectTimeout ?? 10) * 1000,
       commandRetries: config.commandRetries ?? 1,
+      hciDeviceId,
     })
 
     api.on("didFinishLaunching", () => {
       this.discoverDevices()
       void this.ble.discoverGoveeDevices()
         .catch(error => this.log.warn("Govee BLE discovery failed: %s", errorMessage(error)))
+    })
+
+    api.on("shutdown", () => {
+      void this.ble.stop()
     })
   }
 

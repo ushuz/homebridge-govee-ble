@@ -53,7 +53,8 @@
         "title": "Bluetooth adapter ID",
         "type": "integer",
         "minimum": 0,
-        "default": 0
+        "default": 0,
+        "description": "BlueZ adapter index (hci0 = 0). Use the same value as other BLE plugins so they share one adapter lock around scan/connect (node-ble)."
       },
       "scanTimeout": {
         "title": "Scan timeout",

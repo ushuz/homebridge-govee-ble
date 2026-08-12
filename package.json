@@ -36,10 +36,7 @@
     "h61e0"
   ],
   "dependencies": {
-    "@stoprocent/noble": "2.7.1"
-  },
-  "optionalDependencies": {
-    "@stoprocent/bluetooth-hci-socket": "2.3.0"
+    "node-ble": "1.13.0"
   },
   "devDependencies": {
     "@types/node": "20.17.19",
