@@ -30,6 +30,32 @@ export function createPowerFrame(on: boolean): Buffer {
   return createFrame(Command.power, on ? 0x01 : 0x00)
 }
 
+/** 0xaa query — device replies on the notify characteristic (0xee / 0xaa) */
+export function createStatusFrame(): Buffer {
+  const frame = Buffer.alloc(PACKET_SIZE)
+  frame[0] = 0xaa
+  frame[1] = Command.power
+  let checksum = 0
+  for (const byte of frame.subarray(0, PACKET_SIZE - 1)) {
+    checksum ^= byte
+  }
+  frame[PACKET_SIZE - 1] = checksum
+  return frame
+}
+
+/** parse a notify payload from a status query (power at byte 2) */
+export function parseStatusPacket(buffer: Buffer): { on: boolean } | null {
+  if (!buffer || buffer.length < 3) {
+    return null
+  }
+  const header = buffer[0]
+  const command = buffer[1]
+  if ((header !== 0xee && header !== 0xaa) || command !== Command.power) {
+    return null
+  }
+  return { on: buffer[2] !== 0 }
+}
+
 export function createBrightnessFrame(brightness: number): Buffer {
   const normalized = clamp(Math.round(brightness), 0, 100)
   return createFrame(Command.brightness, Math.floor(normalized * 0xff / 100))

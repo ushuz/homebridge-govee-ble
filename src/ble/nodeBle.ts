@@ -79,6 +79,20 @@ export interface BleBus {
 /** injectable factory for tests */
 export type BleBusFactory = (hciDeviceId: number) => Promise<BleBus>
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const Device = require("node-ble/src/Device") as new (
+  dbus: unknown,
+  adapter: string,
+  device: string,
+) => NodeBleDevice
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const BusHelper = require("node-ble/src/BusHelper") as {
+  prototype: { children: () => Promise<string[]>, _prepare: () => Promise<void> }
+  buildChildren: (path: string, nodes: string[]) => string[]
+}
+
+let busHelperPatched = false
+
 /** open dbus connection and bind the configured hciN adapter (no silent fallback) */
 export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
   const { bluetooth, destroy } = nodeBle.createBluetooth()
@@ -86,11 +100,7 @@ export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
   const dbus = (bluetooth as { dbus?: { on?: (event: string, cb: (err: Error) => void) => void } }).dbus
   if (dbus?.on) {
     dbus.on("error", (err: Error) => {
-      try {
-        destroy()
-      } catch {
-        // ignore
-      }
+      // do not destroy() — that orphans an in-flight adapter lock
       process.stderr.write(`[node-ble] dbus error: ${err?.message || err}\n`)
     })
   }
@@ -107,6 +117,8 @@ export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
     if (!(await adapter.isPowered())) {
       throw new Error(`bluetooth adapter ${preferred} is not powered`)
     }
+    patchBusHelperChildren()
+    patchAdapterDeviceCache(adapter)
     return { adapter, adapterName: preferred, destroy }
   } catch (err) {
     try {
@@ -115,6 +127,178 @@ export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
       // ignore
     }
     throw err
+  }
+}
+
+/**
+ * node-ble BusHelper.children() rebuilds a dbus-next ProxyObject every call.
+ * each new proxy adds AddMatch rules until dbus hits max_match_rules (2048).
+ * reuse the existing proxy and refresh the child list via introspect.
+ */
+function patchBusHelperChildren(): void {
+  if (busHelperPatched) {
+    return
+  }
+  BusHelper.prototype.children = async function childrenReuseProxy(this: {
+    _ready?: boolean
+    _prepare: () => Promise<void>
+    _objectProxy?: {
+      nodes?: string[]
+      interfaces?: Record<string, { Introspect?: () => Promise<string> }>
+      getInterface?: (name: string) => { Introspect: () => Promise<string> }
+    }
+    object: string
+  }): Promise<string[]> {
+    if (!this._ready) {
+      await this._prepare()
+    }
+    const xml = await introspectXml(this)
+    if (this._objectProxy) {
+      this._objectProxy.nodes = childPathsFromIntrospect(this.object, xml)
+    }
+    return BusHelper.buildChildren(this.object, this._objectProxy?.nodes ?? [])
+  }
+  busHelperPatched = true
+}
+
+async function introspectXml(helper: {
+  _objectProxy?: {
+    interfaces?: Record<string, { Introspect?: () => Promise<string> }>
+    getInterface?: (name: string) => { Introspect: () => Promise<string> }
+  }
+}): Promise<string> {
+  const proxy = helper._objectProxy
+  if (!proxy) {
+    return "<node></node>"
+  }
+  const named = proxy.interfaces?.["org.freedesktop.DBus.Introspectable"]
+  if (named?.Introspect) {
+    return named.Introspect()
+  }
+  try {
+    const iface = proxy.getInterface?.("org.freedesktop.DBus.Introspectable")
+    if (iface?.Introspect) {
+      return iface.Introspect()
+    }
+  } catch {
+    // ignore
+  }
+  return "<node></node>"
+}
+
+/** parse immediate child object paths from introspect xml */
+export function childPathsFromIntrospect(parentPath: string, xml: string): string[] {
+  const paths: string[] = []
+  const re = /<node\s+name="([^"]+)"/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(xml)) !== null) {
+    const name = match[1]
+    if (!name || name.includes("/")) {
+      continue
+    }
+    paths.push(`${parentPath}/${name}`)
+  }
+  return paths
+}
+
+function patchAdapterDeviceCache(adapter: NodeBleAdapter): void {
+  const anyAdapter = adapter as NodeBleAdapter & {
+    dbus?: unknown
+    adapter?: string
+    __deviceCache?: Map<string, NodeBleDevice>
+  }
+  const cache = anyAdapter.__deviceCache ?? new Map<string, NodeBleDevice>()
+  anyAdapter.__deviceCache = cache
+  const adapterName = anyAdapter.adapter ?? "hci0"
+
+  adapter.getDevice = async (uuid: string) => {
+    const formatted = formatBleAddress(uuid)
+    const listed = await adapter.devices()
+    const onBus = listed.some((address) => formatBleAddress(address) === formatted)
+    if (!onBus) {
+      cache.delete(formatted)
+      throw new Error("Device not found")
+    }
+    const existing = cache.get(formatted)
+    if (existing) {
+      return existing
+    }
+    const serialized = `dev_${formatted.toUpperCase().replace(/:/g, "_")}`
+    const device = hardenDevice(new Device(anyAdapter.dbus, adapterName, serialized))
+    cache.set(formatted, device)
+    return device
+  }
+}
+
+export function forgetCachedDevice(adapter: NodeBleAdapter, address: string): void {
+  const cache = (adapter as NodeBleAdapter & {
+    __deviceCache?: Map<string, NodeBleDevice>
+  }).__deviceCache
+  cache?.delete(formatBleAddress(address))
+}
+
+export function isMissingBluezInterface(error: unknown): boolean {
+  return /interface not found in proxy object/i.test(
+    error instanceof Error ? error.message : String(error),
+  )
+}
+
+function hardenDevice(device: NodeBleDevice): NodeBleDevice {
+  const anyDevice = device as NodeBleDevice & {
+    __hardened?: boolean
+    helper?: { removeListeners?: () => void }
+  }
+  if (anyDevice.__hardened) {
+    return device
+  }
+  anyDevice.__hardened = true
+
+  const origConnect = device.connect.bind(device)
+  const origDisconnect = device.disconnect.bind(device)
+  device.connect = async () => {
+    if (await isDeviceConnected(device)) {
+      return
+    }
+    await origConnect()
+  }
+  device.disconnect = async () => {
+    try {
+      await origDisconnect()
+    } finally {
+      try {
+        anyDevice.helper?.removeListeners?.()
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const origGatt = device.gatt.bind(device)
+  let gattCached: NodeBleGattServer | undefined
+  device.gatt = async () => {
+    if (gattCached) {
+      try {
+        const services = await gattCached.services()
+        if (services.length > 0) {
+          return gattCached
+        }
+      } catch {
+        gattCached = undefined
+      }
+    }
+    gattCached = await origGatt()
+    return gattCached
+  }
+
+  return device
+}
+
+async function isDeviceConnected(device: NodeBleDevice): Promise<boolean> {
+  try {
+    const value = await device.isConnected()
+    return value === true || value === "true"
+  } catch {
+    return false
   }
 }
 

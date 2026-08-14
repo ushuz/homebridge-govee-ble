@@ -71,8 +71,39 @@ export class GoveeLightAccessory {
       .onSet(value => this.setColorTemperature(value))
   }
 
+  /** pull power state from the strip and push it into homekit */
+  async syncFromDevice(): Promise<void> {
+    const device = this.accessory.context.device
+    if (!device) {
+      return
+    }
+    try {
+      const on = await this.ble.readPowerState(device.address)
+      if (on === null) {
+        this.log.warn("[%s] status query returned no power state", this.deviceName())
+        return
+      }
+      if (this.on === on) {
+        this.log.info("[%s] power is %s", this.deviceName(), on ? "on" : "off")
+        return
+      }
+      this.log.info(
+        "[%s] power is %s (was %s)",
+        this.deviceName(),
+        on ? "on" : "off",
+        this.on ? "on" : "off",
+      )
+      this.on = on
+      this.persistState()
+    } catch (error) {
+      this.log.warn("[%s] failed to read power state: %s", this.deviceName(), errorMessage(error))
+    }
+  }
+
   private async setPower(value: CharacteristicValue): Promise<void> {
     const on = Boolean(value)
+    const name = this.deviceName()
+    this.log.info("[%s] set power %s", name, on ? "on" : "off")
     await this.send(createPowerFrame(on))
     this.on = on
     this.persistState()
@@ -80,6 +111,8 @@ export class GoveeLightAccessory {
 
   private async setBrightness(value: CharacteristicValue): Promise<void> {
     const brightness = Number(value)
+    const name = this.deviceName()
+    this.log.info("[%s] set brightness %s%%", name, brightness)
     await this.send(createBrightnessFrame(brightness))
     this.brightness = brightness
     this.persistState()
@@ -97,9 +130,19 @@ export class GoveeLightAccessory {
 
   private async setColorTemperature(value: CharacteristicValue): Promise<void> {
     this.cancelColorUpdate()
-    const [red, green, blue] = colorTemperatureToRgb(Number(value))
+    const mired = Number(value)
+    const [red, green, blue] = colorTemperatureToRgb(mired)
+    const name = this.deviceName()
+    this.log.info(
+      "[%s] set color temperature %s mired (rgb %s,%s,%s)",
+      name,
+      mired,
+      red,
+      green,
+      blue,
+    )
     await this.send(createColorFrame(red, green, blue))
-    this.colorTemperature = Number(value)
+    this.colorTemperature = mired
     this.persistState()
   }
 
@@ -118,8 +161,18 @@ export class GoveeLightAccessory {
     const hue = this.targetHue
     const saturation = this.targetSaturation
     const [red, green, blue] = hsbToRgb(hue, saturation)
+    const name = this.deviceName()
 
     try {
+      this.log.info(
+        "[%s] set color hue=%s sat=%s (rgb %s,%s,%s)",
+        name,
+        hue,
+        saturation,
+        red,
+        green,
+        blue,
+      )
       await this.send(createColorFrame(red, green, blue))
       this.hue = hue
       this.saturation = saturation
@@ -154,6 +207,10 @@ export class GoveeLightAccessory {
     }
   }
 
+  private deviceName(): string {
+    return this.accessory.context.device?.name ?? this.accessory.displayName
+  }
+
   private persistState(): void {
     this.accessory.context.state = {
       on: this.on,
@@ -162,6 +219,8 @@ export class GoveeLightAccessory {
       saturation: this.saturation,
       colorTemperature: this.colorTemperature,
     }
+    this.service.updateCharacteristic(this.platform.Characteristic.On, this.on)
+    this.service.updateCharacteristic(this.platform.Characteristic.Brightness, this.brightness)
   }
 }
 

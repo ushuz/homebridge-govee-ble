@@ -3,7 +3,9 @@ import type { Logger } from "homebridge"
 import { withBleAdapterLock } from "./ble/adapterLock"
 import {
   ensureDiscovery,
+  forgetCachedDevice,
   formatBleAddress,
+  isMissingBluezInterface,
   normalizeBleAddress,
   openBleBus,
   stopDiscoveryIfStarted,
@@ -13,7 +15,8 @@ import {
   type NodeBleDevice,
   type NodeBleGattCharacteristic,
 } from "./ble/nodeBle"
-import { GOVEE_SERVICE_UUID, GOVEE_WRITE_UUID } from "./settings"
+import { createStatusFrame, parseStatusPacket } from "./protocol"
+import { GOVEE_NOTIFY_UUID, GOVEE_SERVICE_UUID, GOVEE_WRITE_UUID } from "./settings"
 
 interface BleControllerOptions {
   scanTimeout: number
@@ -40,10 +43,10 @@ export class BleController {
   private readonly openBus: BleBusFactory
   private readonly devices = new Map<string, NodeBleDevice>()
   private readonly writeChars = new WeakMap<NodeBleDevice, NodeBleGattCharacteristic>()
+  private readonly notifyChars = new WeakMap<NodeBleDevice, NodeBleGattCharacteristic>()
   private readonly watched = new WeakSet<NodeBleDevice>()
   /** node-ble connect() already run for this device (listeners installed) */
   private readonly sessionReady = new WeakSet<NodeBleDevice>()
-  private queue: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly log: Logger,
@@ -58,11 +61,14 @@ export class BleController {
     return this.enqueue(() => this.sendWithRetries(normalizedAddress, frame))
   }
 
+  /** read power state from the strip (0xaa query / notify reply) */
+  readPowerState(address: string): Promise<boolean | null> {
+    const normalizedAddress = normalizeBleAddress(address)
+    return this.enqueue(() => this.readPowerStateOnce(normalizedAddress))
+  }
+
   discoverGoveeDevices(): Promise<void> {
-    // serialize with other work, but lock only the radio window inside scan
-    const queued = this.queue.then(() => this.scanForGoveeDevices())
-    this.queue = queued.catch(() => undefined)
-    return queued
+    return this.enqueue(() => this.scanForGoveeDevices())
   }
 
   /** disconnect retained sessions and close the dbus bus (homebridge shutdown) */
@@ -98,13 +104,11 @@ export class BleController {
   }
 
   /**
-   * serialize work inside this plugin, and take the cross-plugin adapter lock
-   * so peers (e.g. airthings-ble) do not overlap scan/connect on the same radio.
+   * serialize on the shared in-process ble queue (and file lock for other
+   * processes). plugin-local this.queue is no longer the radio mutex.
    */
-  private enqueue(operation: () => Promise<void>): Promise<void> {
-    const queued = this.queue.then(() => this.withAdapterLock(operation))
-    this.queue = queued.catch(() => undefined)
-    return queued
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    return this.withAdapterLock(operation)
   }
 
   private withAdapterLock<T>(operation: () => Promise<T>): Promise<T> {
@@ -212,8 +216,19 @@ export class BleController {
   }
 
   private async sendOnce(address: string, frame: Buffer): Promise<void> {
-    const device = await this.findDevice(address)
-    await this.ensureConnected(device, address)
+    let device: NodeBleDevice
+    try {
+      device = await this.findDevice(address)
+      await this.ensureConnected(device, address)
+    } catch (error) {
+      if (isMissingBluezInterface(error)) {
+        this.forgetDevice(address)
+        device = await this.findDevice(address)
+        await this.ensureConnected(device, address)
+      } else {
+        throw error
+      }
+    }
 
     let characteristic = this.writeChars.get(device)
     if (!characteristic) {
@@ -230,40 +245,135 @@ export class BleController {
     await delay(100)
   }
 
-  private async findDevice(address: string): Promise<NodeBleDevice> {
+  private forgetDevice(address: string, device?: NodeBleDevice): void {
+    if (device) {
+      this.writeChars.delete(device)
+      this.notifyChars.delete(device)
+    }
     const cached = this.devices.get(address)
     if (cached) {
-      return cached
+      this.writeChars.delete(cached)
+      this.notifyChars.delete(cached)
+      this.devices.delete(address)
     }
+    if (this.bus) {
+      forgetCachedDevice(this.bus.adapter, address)
+    }
+  }
 
+  private async probeDevice(device: NodeBleDevice): Promise<void> {
+    await device.getAddress()
+  }
+
+  private async findDevice(address: string): Promise<NodeBleDevice> {
     const { adapter } = await this.ensureBus()
     const formatted = formatBleAddress(address)
+
+    const cached = this.devices.get(address)
+    if (cached) {
+      try {
+        await this.probeDevice(cached)
+        return cached
+      } catch (error) {
+        this.log.debug("dropping stale govee device %s: %s", address, errorMessage(error))
+        this.forgetDevice(address, cached)
+      }
+    }
+
     try {
       const device = await adapter.getDevice(formatted)
+      await this.probeDevice(device)
       this.rememberDevice(address, device)
       return device
     } catch {
       // fall through to discovery wait
     }
 
-    // waitDevice needs discovery running; hold the shared radio lock for it
-    return this.withAdapterLock(async () => {
-      const startedHere = await ensureDiscovery(adapter)
-      try {
-        const device = await withTimeout(
-          adapter.waitDevice(formatted, this.options.scanTimeout, 250),
-          this.options.scanTimeout + 1000,
-          `could not find Govee strip ${address}`,
-        )
-        this.rememberDevice(address, device)
-        return device
-      } finally {
-        await stopDiscoveryIfStarted(adapter, startedHere)
+    // caller (enqueue/send) already holds the shared radio lock — do not
+    // re-enter withAdapterLock or we wait on ourselves forever.
+    const startedHere = await ensureDiscovery(adapter)
+    try {
+      const device = await withTimeout(
+        adapter.waitDevice(formatted, this.options.scanTimeout, 250),
+        this.options.scanTimeout + 1000,
+        `could not find Govee strip ${address}`,
+      )
+      this.rememberDevice(address, device)
+      return device
+    } finally {
+      await stopDiscoveryIfStarted(adapter, startedHere)
+    }
+  }
+
+  private async readPowerStateOnce(address: string): Promise<boolean | null> {
+    const device = await this.findDevice(address)
+    await this.ensureConnected(device, address)
+    const write = this.writeChars.get(device) ?? await this.findWriteCharacteristic(device)
+    this.writeChars.set(device, write)
+    const notify = this.notifyChars.get(device) ?? await this.findNotifyCharacteristic(device)
+    this.notifyChars.set(device, notify)
+
+    const packet = await this.queryNotify(write, notify, createStatusFrame())
+    const parsed = packet ? parseStatusPacket(packet) : null
+    return parsed ? parsed.on : null
+  }
+
+  private async queryNotify(
+    write: NodeBleGattCharacteristic,
+    notify: NodeBleGattCharacteristic,
+    frame: Buffer,
+  ): Promise<Buffer | null> {
+    let settled: Buffer | null = null
+    const onData = (buffer: Buffer) => {
+      if (!settled) {
+        settled = buffer
       }
-    })
+    }
+    notify.on("valuechanged", onData)
+    try {
+      await notify.startNotifications()
+      await withTimeout(
+        write.writeValueWithoutResponse(frame),
+        5000,
+        "timed out writing status query",
+      )
+      const deadline = Date.now() + 2000
+      while (Date.now() < deadline && !settled) {
+        await delay(50)
+      }
+      return settled
+    } finally {
+      notify.removeListener("valuechanged", onData)
+      try {
+        await notify.stopNotifications()
+      } catch {
+        // ignore
+      }
+    }
   }
 
   private async findWriteCharacteristic(device: NodeBleDevice): Promise<NodeBleGattCharacteristic> {
+    const { write } = await this.findControlCharacteristics(device)
+    return write
+  }
+
+  private async findNotifyCharacteristic(device: NodeBleDevice): Promise<NodeBleGattCharacteristic> {
+    const cached = this.notifyChars.get(device)
+    if (cached) {
+      return cached
+    }
+    const { notify } = await this.findControlCharacteristics(device)
+    if (!notify) {
+      throw new Error("Govee notify characteristic not found")
+    }
+    this.notifyChars.set(device, notify)
+    return notify
+  }
+
+  private async findControlCharacteristics(device: NodeBleDevice): Promise<{
+    write: NodeBleGattCharacteristic
+    notify: NodeBleGattCharacteristic | null
+  }> {
     const gatt = await withTimeout(
       device.gatt(),
       this.options.connectTimeout,
@@ -282,7 +392,10 @@ export class BleController {
     if (!writeUuid) {
       throw new Error("Govee control characteristic not found")
     }
-    return service.getCharacteristic(writeUuid)
+    const notifyUuid = chars.find((u) => uuidKey(u) === GOVEE_NOTIFY_UUID)
+    const write = await service.getCharacteristic(writeUuid)
+    const notify = notifyUuid ? await service.getCharacteristic(notifyUuid) : null
+    return { write, notify }
   }
 
   private rememberDevice(address: string, device: NodeBleDevice): void {
@@ -293,6 +406,7 @@ export class BleController {
     this.watched.add(device)
     device.on("disconnect", () => {
       this.writeChars.delete(device)
+      this.notifyChars.delete(device)
       // drop cache so the next command fetches a fresh Device and avoids
       // stacking node-ble PropertiesChanged listeners across reconnects
       if (this.devices.get(address) === device) {
@@ -362,11 +476,18 @@ export class BleController {
     if (!device) {
       return
     }
-    this.writeChars.delete(device)
+    let address: string | undefined
     for (const [addr, cached] of this.devices) {
       if (cached === device) {
-        this.devices.delete(addr)
+        address = addr
+        break
       }
+    }
+    if (address) {
+      this.forgetDevice(address, device)
+    } else {
+      this.writeChars.delete(device)
+      this.notifyChars.delete(device)
     }
     if (!(await isConnected(device))) {
       return

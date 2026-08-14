@@ -66,4 +66,40 @@ describe("withBleAdapterLock", () => {
     )
     assert.equal(result, "ok")
   })
+
+  it("steals a same-process lock that is older than sameProcessHungMs", async () => {
+    const held = withBleAdapterLock(
+      { owner: "hung", hciDeviceId: HCI, acquireTimeoutMs: 10_000 },
+      async () => {
+        await new Promise((r) => setTimeout(r, 400))
+        return "hung-done"
+      },
+    )
+    await new Promise((r) => setTimeout(r, 20))
+
+    const stolen = await withBleAdapterLock(
+      {
+        owner: "recovery",
+        hciDeviceId: HCI,
+        sameProcessHungMs: 50,
+        pollIntervalMs: 20,
+        acquireTimeoutMs: 2000,
+      },
+      async () => "recovered",
+    )
+    assert.equal(stolen, "recovered")
+    await held
+  })
+
+  it("re-enters nested withBleAdapterLock in the same operation", async () => {
+    const result = await withBleAdapterLock(
+      { owner: "outer", hciDeviceId: HCI, acquireTimeoutMs: 2000 },
+      async () =>
+        withBleAdapterLock(
+          { owner: "inner", hciDeviceId: HCI, acquireTimeoutMs: 2000 },
+          async () => "nested",
+        ),
+    )
+    assert.equal(result, "nested")
+  })
 })

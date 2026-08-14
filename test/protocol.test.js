@@ -6,7 +6,9 @@ const {
   createBrightnessFrame,
   createColorFrame,
   createPowerFrame,
+  createStatusFrame,
   hsbToRgb,
+  parseStatusPacket,
 } = require("../lib/protocol")
 
 describe("Govee protocol", () => {
@@ -29,6 +31,16 @@ describe("Govee protocol", () => {
     assert.deepEqual(hsbToRgb(120, 100), [0, 255, 0])
     assert.deepEqual(hsbToRgb(240, 100), [0, 0, 255])
     assert.deepEqual(hsbToRgb(42, 0), [255, 255, 255])
+  })
+
+  it("creates a 20-byte status query with an XOR checksum", () => {
+    assert.equal(createStatusFrame().toString("hex"), "aa010000000000000000000000000000000000ab")
+  })
+
+  it("parses power from a status notify packet", () => {
+    assert.deepEqual(parseStatusPacket(Buffer.from("ee0101", "hex")), { on: true })
+    assert.deepEqual(parseStatusPacket(Buffer.from("ee0100", "hex")), { on: false })
+    assert.equal(parseStatusPacket(Buffer.from("330101", "hex")), null)
   })
 
   it("converts HomeKit color temperature to bounded RGB", () => {

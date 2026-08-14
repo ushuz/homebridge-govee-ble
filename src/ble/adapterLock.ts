@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import {
   existsSync,
   mkdirSync,
@@ -15,9 +16,9 @@ import { join } from "node:path"
 /**
  * cross-plugin ble adapter mutex (protocol v1).
  *
- * exclusive lock *directory* under os.tmpdir() so node-ble plugins share one
- * bluez adapter without overlapping scan/connect — works across processes
- * (child bridges) and within one homebridge process.
+ * in-process fifo queue plus exclusive lock *directory* under os.tmpdir().
+ * same-process plugins line up; the file lock only serializes child bridges /
+ * other processes. nested calls in the same op re-enter.
  *
  * - `mkdir` is atomic exclusive create
  * - stale reclaim uses `rename` of the lock dir (only one waiter wins)
@@ -44,6 +45,8 @@ export interface BleAdapterLockOptions {
   staleMs?: number
   /** poll interval while waiting (ms) */
   pollIntervalMs?: number
+  /** steal a same-pid lock older than this (default 90s); hung dbus ops */
+  sameProcessHungMs?: number
   log?: {
     debug?: (message: string, ...args: unknown[]) => void
     warn?: (message: string, ...args: unknown[]) => void
@@ -61,8 +64,16 @@ interface LockPayload {
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 120_000
 const DEFAULT_POLL_INTERVAL_MS = 200
+/** in-process fifo tail per adapter */
+const queueTail = new Map<number, Promise<void>>()
+/** owner currently running in this process, per adapter */
+const queueOwner = new Map<number, string>()
+/** true while an op from this queue item is on the stack */
+const opContext = new AsyncLocalStorage<true>()
 /** do not steal unreadable locks younger than this (create→write race) */
 const UNREADABLE_GRACE_MS = 5_000
+/** same-process hold older than this is a hung owner (dbus death); steal it */
+const DEFAULT_SAME_PROCESS_HUNG_MS = 90_000
 
 function lockDir(hciDeviceId: number): string {
   return join(tmpdir(), `homebridge-ble-hci${hciDeviceId}.lock`)
@@ -115,7 +126,21 @@ function dirAgeMs(dir: string): number {
   }
 }
 
-function isStale(dir: string, payload: LockPayload | null): boolean {
+function lockAgeMs(dir: string, payload: LockPayload | null): number {
+  if (payload) {
+    const started = Date.parse(payload.acquiredAt)
+    if (Number.isFinite(started)) {
+      return Date.now() - started
+    }
+  }
+  return dirAgeMs(dir)
+}
+
+function isStale(
+  dir: string,
+  payload: LockPayload | null,
+  sameProcessHungMs = DEFAULT_SAME_PROCESS_HUNG_MS,
+): boolean {
   if (!existsSync(dir)) {
     return true
   }
@@ -123,7 +148,11 @@ function isStale(dir: string, payload: LockPayload | null): boolean {
     // empty or mid-write lock: busy until grace, then reclaim
     return dirAgeMs(dir) > UNREADABLE_GRACE_MS
   }
-  // never age-steal a live holder (scans/connects may exceed any fixed ttl)
+  // same-process hold that never finished (destroyed dbus bus) — steal
+  if (payload.pid === process.pid && lockAgeMs(dir, payload) > sameProcessHungMs) {
+    return true
+  }
+  // never age-steal a live holder in another process
   return !isProcessAlive(payload.pid)
 }
 
@@ -145,8 +174,9 @@ function trySteal(
   dir: string,
   observed: LockPayload | null,
   log?: BleAdapterLockOptions["log"],
+  sameProcessHungMs = DEFAULT_SAME_PROCESS_HUNG_MS,
 ): boolean {
-  if (!isStale(dir, observed)) {
+  if (!isStale(dir, observed, sameProcessHungMs)) {
     return false
   }
 
@@ -154,7 +184,7 @@ function trySteal(
   if (!sameHolder(observed, current)) {
     return false
   }
-  if (!isStale(dir, current)) {
+  if (!isStale(dir, current, sameProcessHungMs)) {
     return false
   }
 
@@ -239,20 +269,84 @@ function release(dir: string, owner: string, token: string): void {
 }
 
 /**
- * run `fn` while holding the shared ble adapter lock.
- * other plugins using the same protocol wait until release.
+ * run `fn` as the next ble op on this adapter.
+ * same process: fifo queue (nested calls re-enter).
+ * other processes: file lock after this process reaches the head.
  */
 export async function withBleAdapterLock<T>(
   options: BleAdapterLockOptions,
   fn: () => Promise<T>,
 ): Promise<T> {
+  if (opContext.getStore()) {
+    return fn()
+  }
+
   const owner = options.owner
   const hciDeviceId = options.hciDeviceId ?? 0
   const acquireTimeoutMs = options.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS
+  const log = options.log
+  const deadline = Date.now() + acquireTimeoutMs
+
+  const prev = queueTail.get(hciDeviceId) ?? Promise.resolve()
+  let releaseQueue!: () => void
+  const mine = new Promise<void>((resolve) => {
+    releaseQueue = resolve
+  })
+  queueTail.set(
+    hciDeviceId,
+    prev.then(() => mine, () => mine),
+  )
+
+  const ahead = queueOwner.get(hciDeviceId)
+  if (ahead) {
+    log?.info?.(`ble op queued behind ${ahead}`)
+  }
+
+  let timer: NodeJS.Timeout | undefined
+  try {
+    await Promise.race([
+      prev,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `timed out after ${acquireTimeoutMs}ms waiting for ble adapter queue`
+              + ` (hci${hciDeviceId})`,
+            ),
+          )
+        }, Math.max(0, deadline - Date.now()))
+      }),
+    ])
+  } catch (err) {
+    releaseQueue()
+    throw err
+  } finally {
+    if (timer) {
+      clearTimeout(timer)
+    }
+  }
+
+  queueOwner.set(hciDeviceId, owner)
+  try {
+    return await opContext.run(true, () => withFileLock(options, fn, deadline))
+  } finally {
+    if (queueOwner.get(hciDeviceId) === owner) {
+      queueOwner.delete(hciDeviceId)
+    }
+    releaseQueue()
+  }
+}
+
+async function withFileLock<T>(
+  options: BleAdapterLockOptions,
+  fn: () => Promise<T>,
+  deadline: number,
+): Promise<T> {
+  const owner = options.owner
+  const hciDeviceId = options.hciDeviceId ?? 0
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
   const log = options.log
   const dir = lockDir(hciDeviceId)
-  const deadline = Date.now() + acquireTimeoutMs
   let waited = false
   let loggedWait = false
 
@@ -270,7 +364,7 @@ export async function withBleAdapterLock<T>(
     }
 
     const holder = readLock(dir)
-    if (trySteal(dir, holder, log)) {
+    if (trySteal(dir, holder, log, options.sameProcessHungMs)) {
       continue
     }
 
@@ -288,8 +382,8 @@ export async function withBleAdapterLock<T>(
   const holder = readLock(dir)
   const heldBy = holder ? `${holder.owner} pid=${holder.pid}` : "unknown"
   throw new Error(
-    `timed out after ${acquireTimeoutMs}ms waiting for ble adapter lock`
-    + ` (hci${hciDeviceId}, held by ${heldBy})`,
+    `timed out after ${options.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS}ms`
+    + ` waiting for ble adapter lock (hci${hciDeviceId}, held by ${heldBy})`,
   )
 }
 

@@ -44,6 +44,7 @@ function createMockBus({ devices = new Map(), onConnect, onWrite } = {}) {
 function createMockDevice(address, { name = "Govee_H61E0_EEFF", writeImpl } = {}) {
   let connected = false
   const emitter = new EventEmitter()
+  const notifyEmitter = new EventEmitter()
   const writeChar = {
     async getUUID() { return "00010203-0405-0607-0809-0a0b0c0d2b11" },
     async writeValueWithoutResponse(frame) {
@@ -51,12 +52,30 @@ function createMockDevice(address, { name = "Govee_H61E0_EEFF", writeImpl } = {}
     },
     async writeValue() {},
   }
+  const notifyChar = {
+    async getUUID() { return "00010203-0405-0607-0809-0a0b0c0d2b10" },
+    async startNotifications() {},
+    async stopNotifications() {},
+    on(event, listener) {
+      notifyEmitter.on(event, listener)
+      return notifyChar
+    },
+    removeListener(event, listener) {
+      notifyEmitter.removeListener(event, listener)
+      return notifyChar
+    },
+  }
   const service = {
     async getUUID() { return "000102030405060708090a0b0c0d1910" },
     async characteristics() {
-      return ["00010203-0405-0607-0809-0a0b0c0d2b11"]
+      return [
+        "00010203-0405-0607-0809-0a0b0c0d2b11",
+        "00010203-0405-0607-0809-0a0b0c0d2b10",
+      ]
     },
-    async getCharacteristic() { return writeChar },
+    async getCharacteristic(uuid) {
+      return uuid.includes("2b10") ? notifyChar : writeChar
+    },
   }
   const device = {
     async getName() { return name },
@@ -89,6 +108,8 @@ function createMockDevice(address, { name = "Govee_H61E0_EEFF", writeImpl } = {}
     // test hooks
     _setConnected(v) { connected = v },
     _writeChar: writeChar,
+    _notifyChar: notifyChar,
+    _emitNotify(buffer) { notifyEmitter.emit("valuechanged", buffer) },
   }
   return device
 }
@@ -118,6 +139,22 @@ it("finds, writes to, and keeps the configured strip connected", async () => {
   assert.equal(writtenFrames.length, 1)
   assert.equal(writtenFrames[0].frame.toString("hex"), frame.toString("hex"))
   assert.equal(writtenFrames[0].withoutResponse, true)
+})
+
+it("reads power state from a status notify packet", async () => {
+  const address = "aa:bb:cc:dd:ee:ff"
+  const device = createMockDevice(address, {
+    writeImpl() {
+      setTimeout(() => device._emitNotify(Buffer.from("ee0101", "hex")), 10)
+    },
+  })
+  const bus = createMockBus({ devices: new Map([[address, device]]) })
+  const controller = new BleController(
+    { debug() {}, info() {}, warn() {} },
+    { scanTimeout: 100, connectTimeout: 100, commandRetries: 0 },
+    async () => bus,
+  )
+  assert.equal(await controller.readPowerState(address), true)
 })
 
 it("writes when bluez already reports connected", async () => {

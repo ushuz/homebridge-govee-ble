@@ -17,6 +17,7 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
   readonly Service: typeof Service
   readonly Characteristic: typeof Characteristic
   readonly accessories = new Map<string, PlatformAccessory<GoveeAccessoryContext>>()
+  private readonly lights = new Map<string, GoveeLightAccessory>()
   private readonly ble: BleController
   private readonly config: GoveePlatformConfig
 
@@ -42,6 +43,7 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
     api.on("didFinishLaunching", () => {
       this.discoverDevices()
       void this.ble.discoverGoveeDevices()
+        .then(() => this.syncLights())
         .catch(error => this.log.warn("Govee BLE discovery failed: %s", errorMessage(error)))
     })
 
@@ -85,7 +87,7 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
         this.accessories.set(uuid, accessory)
       }
 
-      new GoveeLightAccessory(this, accessory, this.ble)
+      this.lights.set(uuid, new GoveeLightAccessory(this, accessory, this.ble))
       this.log.info("Configured %s (%s) at %s", device.name, device.model ?? "H61E0", device.address)
     }
 
@@ -96,6 +98,12 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
       for (const accessory of staleAccessories) {
         this.accessories.delete(accessory.UUID)
       }
+    }
+  }
+
+  private async syncLights(): Promise<void> {
+    for (const light of this.lights.values()) {
+      await light.syncFromDevice()
     }
   }
 

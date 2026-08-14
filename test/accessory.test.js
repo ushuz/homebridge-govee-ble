@@ -24,6 +24,9 @@ it("lets color temperature supersede a pending hue and saturation update", async
       return this
     },
     getCharacteristic: characteristic,
+    updateCharacteristic() {
+      return this
+    },
   }
   const informationService = {
     setCharacteristic() {
@@ -46,7 +49,7 @@ it("lets color temperature supersede a pending hue and saturation update", async
     Lightbulb: "Lightbulb",
   }
   const platform = {
-    log: { error() {} },
+    log: { info() {}, error() {} },
     Characteristic,
     Service,
     api: { hap: { HapStatusError: Error } },
