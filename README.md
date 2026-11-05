@@ -37,13 +37,13 @@ Find the strip's BLE address while the Govee app is disconnected:
 bluetoothctl scan on
 ```
 
-Look for a device named like `Govee_H61E0_XXXX`. Copy its colon-separated BLE
-address, then stop the scan with `bluetoothctl scan off`.
+Look for a device named like `Govee_H61E0_XXXX` or `ihoment_H61E0_XXXX`. Copy
+its colon-separated BLE address, then stop the scan with `bluetoothctl scan off`.
 
-Close the Govee app before using the plugin. After the first successful
-command, the plugin keeps the BLE session open to avoid repeated connection
-setup on Raspberry Pi. The app cannot connect until Homebridge stops or the
-BLE session drops.
+Close the Govee app before using the plugin. After a successful command the
+plugin holds the BLE session, writes a keep-alive about every 2 seconds, and
+disconnects after a few seconds of idle so another BLE plugin can use the
+adapter. The Govee app cannot connect while that session is open.
 
 The plugin also scans at startup and logs each nearby H61E0:
 
@@ -54,7 +54,9 @@ Discovered 1 Govee H61E0 device(s)
 ```
 
 You can initially configure `"devices": []`, restart Homebridge, and copy the
-address from this log before adding the device configuration.
+address from this log before adding the device configuration. When a strip
+address is already configured, startup skips this scan so the first command
+does not wait behind it.
 
 ## Install
 
@@ -113,9 +115,12 @@ scan/connect so only one plugin drives the radio at a time. Set the same
 - BLE operations are serialized so simultaneous HomeKit changes cannot compete
   for the Raspberry Pi's single adapter. The same lock also coordinates with
   peer BLE plugins that implement the shared protocol.
-- A successful connection and control characteristic are reused until the strip
-  disconnects. The plugin then reconnects and discovers the characteristic
-  again.
+- A successful connection and control characteristic are reused for a short
+  idle window (default 8 seconds). During that window the plugin writes the
+  `0xAA 0x01` keep-alive about every 2 seconds. It then disconnects so the
+  adapter is free for other plugins. The next command connects again.
+- Set `keepAliveInterval` or `idleDisconnect` to `0` to disable either timer.
+  `idleDisconnect: 0` keeps the session until the strip disconnects.
 - H61E0 does not provide reliable state reads through this protocol. Homebridge
   therefore reports the last state it successfully sent. Changes made with the
   Govee app or inline controller are not reflected until Homebridge sends a new
@@ -137,6 +142,9 @@ homebridge -D
 - `bluetooth adapter hci0 is not powered`: `sudo rfkill unblock bluetooth`
 - D-Bus permission errors: configure `org.bluez` policy for the homebridge user
 - `could not find Govee strip`: verify the address and close the Govee app
+- `power-cycling bluetooth adapter`: discovery failed for a reason other than
+  "already in progress". A power cycle disconnects every device on that
+  adapter, including other BLE plugins.
 
 ## Protocol
 

@@ -12,6 +12,10 @@ export interface GoveePlatformConfig extends PlatformConfig {
   scanTimeout?: number
   connectTimeout?: number
   commandRetries?: number
+  /** seconds between session keep-alives; 0 disables. default 2 */
+  keepAliveInterval?: number
+  /** seconds to hold the link after the last command; 0 keeps it open. default 8 */
+  idleDisconnect?: number
 }
 
 export interface GoveeAccessoryContext {

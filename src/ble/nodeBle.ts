@@ -118,6 +118,7 @@ export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
       throw new Error(`bluetooth adapter ${preferred} is not powered`)
     }
     patchBusHelperChildren()
+    patchGattServerInit()
     patchAdapterDeviceCache(adapter)
     return { adapter, adapterName: preferred, destroy }
   } catch (err) {
@@ -243,10 +244,25 @@ export function isMissingBluezInterface(error: unknown): boolean {
   )
 }
 
-function hardenDevice(device: NodeBleDevice): NodeBleDevice {
+/**
+ * node-ble only subscribes to Connected in connect(), and connect() is a
+ * no-op here when BlueZ already reports connected. Without this watch the
+ * controller never hears a later disconnect and keeps writing a dead GATT
+ * characteristic.
+ */
+export function hardenDevice(device: NodeBleDevice): NodeBleDevice {
   const anyDevice = device as NodeBleDevice & {
     __hardened?: boolean
-    helper?: { removeListeners?: () => void }
+    __watchInstalled?: boolean
+    emit?: (event: "connect" | "disconnect", payload: { connected: boolean }) => void
+    helper?: {
+      removeListeners?: () => void
+      removeAllListeners?: (event: string) => void
+      on?: (
+        event: string,
+        listener: (propertiesChanged: { Connected?: { value?: unknown } }) => void,
+      ) => void
+    }
   }
   if (anyDevice.__hardened) {
     return device
@@ -255,16 +271,31 @@ function hardenDevice(device: NodeBleDevice): NodeBleDevice {
 
   const origConnect = device.connect.bind(device)
   const origDisconnect = device.disconnect.bind(device)
+  const origGatt = device.gatt.bind(device)
+  let gattCached: NodeBleGattServer | undefined
+  const dropGatt = () => {
+    gattCached = undefined
+  }
   device.connect = async () => {
-    if (await isDeviceConnected(device)) {
+    const connected = await isDeviceConnected(device)
+    if (!connected) {
+      dropGatt()
+      try {
+        anyDevice.helper?.removeAllListeners?.("PropertiesChanged")
+      } catch {
+        // ignore
+      }
+      anyDevice.__watchInstalled = false
+      await origConnect()
       return
     }
-    await origConnect()
+    installConnectedWatch(anyDevice, dropGatt)
   }
   device.disconnect = async () => {
     try {
       await origDisconnect()
     } finally {
+      dropGatt()
       try {
         anyDevice.helper?.removeListeners?.()
       } catch {
@@ -273,8 +304,6 @@ function hardenDevice(device: NodeBleDevice): NodeBleDevice {
     }
   }
 
-  const origGatt = device.gatt.bind(device)
-  let gattCached: NodeBleGattServer | undefined
   device.gatt = async () => {
     if (gattCached) {
       try {
@@ -291,6 +320,38 @@ function hardenDevice(device: NodeBleDevice): NodeBleDevice {
   }
 
   return device
+}
+
+function installConnectedWatch(
+  device: NodeBleDevice & {
+    __watchInstalled?: boolean
+    emit?: (event: "connect" | "disconnect", payload: { connected: boolean }) => void
+    helper?: {
+      on?: (
+        event: string,
+        listener: (propertiesChanged: { Connected?: { value?: unknown } }) => void,
+      ) => void
+    }
+  },
+  onDisconnect: () => void,
+): void {
+  if (device.__watchInstalled || !device.helper?.on || !device.emit) {
+    return
+  }
+  device.__watchInstalled = true
+  const emit = device.emit.bind(device)
+  device.helper.on("PropertiesChanged", (propertiesChanged) => {
+    if (!propertiesChanged || !("Connected" in propertiesChanged)) {
+      return
+    }
+    const value = propertiesChanged.Connected?.value
+    if (value) {
+      emit("connect", { connected: true })
+    } else {
+      onDisconnect()
+      emit("disconnect", { connected: false })
+    }
+  })
 }
 
 async function isDeviceConnected(device: NodeBleDevice): Promise<boolean> {
@@ -361,6 +422,185 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+const GATT_RESOLVE_TIMEOUT_MS = 10_000
+let gattResolveTimeoutMs = GATT_RESOLVE_TIMEOUT_MS
+let gattServerPatched = false
+
+/**
+ * Resolve when `read()` is true, or when `subscribe` reports a truthy value.
+ * Subscribes before the first read so a change between a check and a signal
+ * listener is not lost. Polls because BlueZ sometimes never emits the signal.
+ * Rejects on timeout instead of waiting forever.
+ */
+export async function waitForTruthyProperty(
+  read: () => Promise<unknown>,
+  subscribe: (onValue: (value: unknown) => void) => () => void,
+  timeoutMs: number,
+  timeoutMessage: string,
+  pollMs = 200,
+): Promise<void> {
+  let unsubscribe = () => {}
+  let timer: NodeJS.Timeout | undefined
+  let pollTimer: NodeJS.Timeout | undefined
+  let settled = false
+  const isTruthy = (value: unknown) => value === true || value === "true"
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const finish = (error?: Error) => {
+        if (settled) {
+          return
+        }
+        settled = true
+        if (timer) {
+          clearTimeout(timer)
+        }
+        if (pollTimer) {
+          clearTimeout(pollTimer)
+        }
+        if (error) {
+          reject(error)
+        } else {
+          resolve()
+        }
+      }
+
+      try {
+        unsubscribe = subscribe((value) => {
+          if (isTruthy(value)) {
+            finish()
+          }
+        })
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)))
+        return
+      }
+
+      timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs)
+
+      const poll = () => {
+        if (settled) {
+          return
+        }
+        read().then((value) => {
+          if (settled) {
+            return
+          }
+          if (isTruthy(value)) {
+            finish()
+            return
+          }
+          pollTimer = setTimeout(poll, pollMs)
+        }).catch((error: unknown) => {
+          finish(error instanceof Error ? error : new Error(String(error)))
+        })
+      }
+      poll()
+    })
+  } finally {
+    if (timer) {
+      clearTimeout(timer)
+    }
+    if (pollTimer) {
+      clearTimeout(pollTimer)
+    }
+    try {
+      unsubscribe()
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * node-ble GattServer.init() reads ServicesResolved and, if false, waits for
+ * PropertiesChanged with no timeout. If the property flips true before that
+ * listener is armed, init never returns and every command times out.
+ */
+export function patchGattServerInit(timeoutMs = GATT_RESOLVE_TIMEOUT_MS): void {
+  gattResolveTimeoutMs = timeoutMs
+  if (gattServerPatched) {
+    return
+  }
+  gattServerPatched = true
+
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const GattServer = require("node-ble/src/GattServer") as {
+    prototype: { init: (this: GattServerLike) => Promise<void> }
+  }
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const GattService = require("node-ble/src/GattService") as new (
+    dbus: unknown,
+    adapter: string,
+    device: string,
+    service: string,
+  ) => {
+    getUUID: () => Promise<string>
+    init: () => Promise<void>
+  }
+
+  GattServer.prototype.init = async function initRaceSafe(this: GattServerLike): Promise<void> {
+    this._services = {}
+    const helper = this.helper
+    // prop() builds the Properties proxy. Subscribe only after that exists.
+    try {
+      await helper.prop("ServicesResolved")
+    } catch {
+      // the wait below surfaces a persistent read failure
+    }
+
+    await waitForTruthyProperty(
+      () => helper.prop("ServicesResolved"),
+      (onValue) => {
+        const proxy = helper._propsProxy
+        if (!proxy?.on) {
+          return () => {}
+        }
+        const listener = (iface: string, changed: Record<string, { value?: unknown }>) => {
+          if (iface !== helper.iface || !changed || !("ServicesResolved" in changed)) {
+            return
+          }
+          onValue(changed.ServicesResolved?.value)
+        }
+        proxy.on("PropertiesChanged", listener)
+        return () => {
+          try {
+            proxy.off?.("PropertiesChanged", listener)
+          } catch {
+            // ignore
+          }
+        }
+      },
+      gattResolveTimeoutMs,
+      "timed out waiting for GATT services to resolve",
+    )
+
+    const children = await helper.children()
+    for (const servicePath of children) {
+      const service = new GattService(this.dbus, this.adapter, this.device, servicePath)
+      const uuid = await service.getUUID()
+      await service.init()
+      this._services[uuid] = service
+    }
+  }
+}
+
+interface GattServerLike {
+  _services: Record<string, unknown>
+  dbus: unknown
+  adapter: string
+  device: string
+  helper: {
+    iface: string
+    prop: (name: string) => Promise<unknown>
+    children: () => Promise<string[]>
+    _propsProxy?: {
+      on: (event: string, listener: (iface: string, changed: Record<string, { value?: unknown }>) => void) => void
+      off?: (event: string, listener: (iface: string, changed: Record<string, { value?: unknown }>) => void) => void
+    }
+  }
+}
+
 /**
  * ensure le discovery is running.
  * bluez discovery is owned by the dbus client that started it. try stop (only
@@ -390,11 +630,17 @@ export async function ensureDiscovery(adapter: NodeBleAdapter): Promise<boolean>
     await adapter.startDiscovery()
     return true
   } catch (err) {
-    const msg = String((err as Error)?.message || err)
-    if (/already in progress/i.test(msg)) {
+    // BlueZ reports this as org.bluez.Error.InProgress ("InProgress") or
+    // "Operation already in progress". Power-cycling here drops every other
+    // connection on the adapter, including a peer plugin's session.
+    if (isDiscoveryBusyError(err)) {
       return false
     }
     try {
+      const msg = String((err as Error)?.message || err)
+      process.stderr.write(
+        `[govee-ble] power-cycling bluetooth adapter after discovery error: ${msg}\n`,
+      )
       await powerCycleAdapter(adapter)
       await adapter.startDiscovery()
       return true
@@ -402,6 +648,13 @@ export async function ensureDiscovery(adapter: NodeBleAdapter): Promise<boolean>
       throw err
     }
   }
+}
+
+/** true when startDiscovery failed because a discovery session already exists */
+export function isDiscoveryBusyError(error: unknown): boolean {
+  const typed = error as { message?: string, type?: string }
+  const text = `${typed?.type || ""} ${typed?.message || error}`
+  return /already in progress|inprogress/i.test(text)
 }
 
 /** power-cycle adapter via node-ble BusHelper (clears stuck Discovering) */

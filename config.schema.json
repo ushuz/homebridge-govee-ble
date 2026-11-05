@@ -78,6 +78,22 @@
         "minimum": 0,
         "maximum": 3,
         "default": 1
+      },
+      "keepAliveInterval": {
+        "title": "Keep-alive interval",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 30,
+        "default": 2,
+        "description": "Seconds between keep-alive writes while a session is open. 0 disables. Govee drops or ignores an idle link that stays connected."
+      },
+      "idleDisconnect": {
+        "title": "Idle disconnect",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 120,
+        "default": 8,
+        "description": "Seconds to keep the BLE session after the last command, then disconnect so other plugins can use the adapter. 0 keeps the session until the strip disconnects."
       }
     }
   }
