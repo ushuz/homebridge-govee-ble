@@ -38,11 +38,21 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
       connectTimeout: (config.connectTimeout ?? 10) * 1000,
       commandRetries: config.commandRetries ?? 1,
       hciDeviceId,
+      ...optionalMilliseconds(config.keepAliveInterval),
+      ...optionalIdleMilliseconds(config.idleDisconnect),
     })
 
     api.on("didFinishLaunching", () => {
       this.discoverDevices()
-      void this.ble.discoverGoveeDevices()
+      // a full scan holds the shared adapter lock for scanTimeout. skip it
+      // when an address is already configured so commands and peer plugins
+      // (airthings) are not stuck behind discovery on every restart.
+      const configured = hasUsableDeviceConfig(this.config.devices)
+      if (configured) {
+        this.log.info("Skipping startup BLE scan; a strip address is already configured")
+      }
+      const scan = configured ? Promise.resolve() : this.ble.discoverGoveeDevices()
+      void scan
         .then(() => this.syncLights())
         .catch(error => this.log.warn("Govee BLE discovery failed: %s", errorMessage(error)))
     })
@@ -122,4 +132,38 @@ export class GoveeBlePlatform implements DynamicPlatformPlugin {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** true when startup discovery can be skipped because a strip address is configured */
+export function hasUsableDeviceConfig(devices: DeviceConfig[] | undefined): boolean {
+  return (devices ?? []).some((device) => isUsableDevice(device))
+}
+
+function isUsableDevice(device: DeviceConfig | undefined): boolean {
+  if (!device?.name || !/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(device.address ?? "")) {
+    return false
+  }
+  if (device.model && device.model !== "H61E0") {
+    return false
+  }
+  return true
+}
+
+/** config seconds -> controller ms; undefined keeps the controller default, 0 disables */
+function optionalMilliseconds(
+  seconds: number | undefined,
+): { keepAliveIntervalMs: number } | Record<string, never> {
+  if (seconds === undefined || !Number.isFinite(seconds)) {
+    return {}
+  }
+  return { keepAliveIntervalMs: Math.max(0, seconds) * 1000 }
+}
+
+function optionalIdleMilliseconds(
+  seconds: number | undefined,
+): { idleDisconnectMs: number } | Record<string, never> {
+  if (seconds === undefined || !Number.isFinite(seconds)) {
+    return {}
+  }
+  return { idleDisconnectMs: Math.max(0, seconds) * 1000 }
 }

@@ -4,7 +4,19 @@ const { format } = require("node:util")
 const { it } = require("node:test")
 
 const { BleController } = require("../lib/ble-controller")
-const { createPowerFrame } = require("../lib/protocol")
+const { createPowerFrame, createStatusFrame } = require("../lib/protocol")
+
+function controllerOptions(overrides = {}) {
+  return {
+    scanTimeout: 100,
+    connectTimeout: 100,
+    commandRetries: 0,
+    hciDeviceId: 97,
+    keepAliveIntervalMs: 0,
+    idleDisconnectMs: 0,
+    ...overrides,
+  }
+}
 
 function formatLog(...args) {
   return format(...args)
@@ -126,11 +138,7 @@ it("finds, writes to, and keeps the configured strip connected", async () => {
   const bus = createMockBus({ devices })
 
   const log = { debug() {}, info() {}, warn() {} }
-  const controller = new BleController(log, {
-    scanTimeout: 100,
-    connectTimeout: 100,
-    commandRetries: 0,
-  }, async () => bus)
+  const controller = new BleController(log, controllerOptions(), async () => bus)
 
   const frame = createPowerFrame(true)
   await controller.send(address, frame)
@@ -151,7 +159,7 @@ it("reads power state from a status notify packet", async () => {
   const bus = createMockBus({ devices: new Map([[address, device]]) })
   const controller = new BleController(
     { debug() {}, info() {}, warn() {} },
-    { scanTimeout: 100, connectTimeout: 100, commandRetries: 0 },
+    controllerOptions(),
     async () => bus,
   )
   assert.equal(await controller.readPowerState(address), true)
@@ -167,11 +175,7 @@ it("writes when bluez already reports connected", async () => {
   device._setConnected(true)
   const bus = createMockBus({ devices: new Map([[address, device]]) })
   const log = { debug() {}, info() {}, warn() {} }
-  const controller = new BleController(log, {
-    scanTimeout: 100,
-    connectTimeout: 100,
-    commandRetries: 0,
-  }, async () => bus)
+  const controller = new BleController(log, controllerOptions(), async () => bus)
 
   await controller.send(address, createPowerFrame(true))
   assert.equal(written, true)
@@ -183,11 +187,13 @@ it("logs unique H61E0 devices found during discovery", async () => {
   const d1 = createMockDevice("aa:bb:cc:dd:ee:01", { name: "Govee_H61E0_EE01" })
   const d2 = createMockDevice("aa:bb:cc:dd:ee:02", { name: "Govee_H61E0_EE02" })
   const other = createMockDevice("aa:bb:cc:dd:ee:03", { name: "Other" })
+  const legacy = createMockDevice("aa:bb:cc:dd:ee:04", { name: "ihoment_H61E0_EE04" })
   const bus = createMockBus({
     devices: new Map([
       ["aa:bb:cc:dd:ee:01", d1],
       ["aa:bb:cc:dd:ee:02", d2],
       ["aa:bb:cc:dd:ee:03", other],
+      ["aa:bb:cc:dd:ee:04", legacy],
     ]),
   })
   const log = {
@@ -195,17 +201,15 @@ it("logs unique H61E0 devices found during discovery", async () => {
     info(...args) { logs.push(formatLog(...args)) },
     warn() {},
   }
-  const controller = new BleController(log, {
-    scanTimeout: 20,
-    connectTimeout: 100,
-    commandRetries: 0,
-  }, async () => bus)
+  const controller = new BleController(log, controllerOptions({ scanTimeout: 20 }), async () => bus)
 
   await controller.discoverGoveeDevices()
   const joined = logs.join("\n")
-  assert.match(joined, /Discovered 2 Govee H61E0/)
+  assert.match(joined, /Discovered 3 Govee H61E0/)
   assert.match(joined, /Govee_H61E0_EE01/)
   assert.match(joined, /Govee_H61E0_EE02/)
+  assert.match(joined, /ihoment_H61E0_EE04/)
+  assert.doesNotMatch(joined, /Other/)
 })
 
 it("cancels a timed-out connection without blocking the next command", async () => {
@@ -225,11 +229,11 @@ it("cancels a timed-out connection without blocking the next command", async () 
   // first find works, connect hangs past timeout
   const bus = createMockBus({ devices: new Map([[address, device]]) })
   const log = { debug() {}, info() {}, warn() {} }
-  const controller = new BleController(log, {
+  const controller = new BleController(log, controllerOptions({
     scanTimeout: 50,
     connectTimeout: 50,
     commandRetries: 1,
-  }, async () => bus)
+  }), async () => bus)
 
   await controller.send(address, createPowerFrame(true))
   assert.ok(attempts >= 2)
@@ -244,11 +248,7 @@ it("rediscovers the characteristic after a remote disconnect", async () => {
   })
   const bus = createMockBus({ devices: new Map([[address, device]]) })
   const log = { debug() {}, info() {}, warn() {} }
-  const controller = new BleController(log, {
-    scanTimeout: 100,
-    connectTimeout: 100,
-    commandRetries: 0,
-  }, async () => bus)
+  const controller = new BleController(log, controllerOptions(), async () => bus)
 
   await controller.send(address, createPowerFrame(true))
   assert.equal(writes, 1)
@@ -282,11 +282,7 @@ it("replaces a cached peripheral after adapter power cycle", async () => {
   bus.adapter.devices = async () => [address]
 
   const log = { debug() {}, info() {}, warn() {} }
-  const controller = new BleController(log, {
-    scanTimeout: 100,
-    connectTimeout: 100,
-    commandRetries: 1,
-  }, async () => bus)
+  const controller = new BleController(log, controllerOptions({ commandRetries: 1 }), async () => bus)
 
   await controller.send(address, createPowerFrame(true))
   assert.equal(writes, 1)
@@ -308,13 +304,93 @@ it("waits for a disconnecting peripheral before reconnecting", async () => {
   device._setConnected(true)
   const bus = createMockBus({ devices: new Map([[address, device]]) })
   const log = { debug() {}, info() {}, warn() {} }
-  const controller = new BleController(log, {
-    scanTimeout: 100,
-    connectTimeout: 100,
-    commandRetries: 0,
-  }, async () => bus)
+  const controller = new BleController(log, controllerOptions(), async () => bus)
 
   await controller.send(address, createPowerFrame(true))
   assert.equal(writes, 1)
   assert.equal(await device.isConnected(), true)
+})
+
+it("stops discovery for a command and leaves it stopped", async () => {
+  const address = "aa:bb:cc:dd:ee:ff"
+  const device = createMockDevice(address, { writeImpl() {} })
+  const bus = createMockBus({ devices: new Map([[address, device]]) })
+  bus._setDiscovering(true)
+  const controller = new BleController(
+    { debug() {}, info() {}, warn() {} },
+    controllerOptions(),
+    async () => bus,
+  )
+
+  await controller.send(address, createPowerFrame(true))
+  assert.equal(await bus.adapter.isDiscovering(), false)
+})
+
+it("rediscovers the write characteristic after a silent disconnect", async () => {
+  const address = "aa:bb:cc:dd:ee:ff"
+  const writes = []
+  const charA = {
+    async writeValueWithoutResponse(frame) { writes.push(["A", frame]) },
+  }
+  const charB = {
+    async writeValueWithoutResponse(frame) { writes.push(["B", frame]) },
+  }
+  let current = charA
+  const device = createMockDevice(address)
+  device.gatt = async () => ({
+    async services() { return ["000102030405060708090a0b0c0d1910"] },
+    async getPrimaryService() {
+      return {
+        async characteristics() {
+          return ["00010203-0405-0607-0809-0a0b0c0d2b11"]
+        },
+        async getCharacteristic() { return current },
+      }
+    },
+  })
+  const bus = createMockBus({ devices: new Map([[address, device]]) })
+  const controller = new BleController(
+    { debug() {}, info() {}, warn() {} },
+    controllerOptions(),
+    async () => bus,
+  )
+
+  await controller.send(address, createPowerFrame(true))
+  device._setConnected(false)
+  current = charB
+  await controller.send(address, createPowerFrame(false))
+
+  assert.deepEqual(writes.map((entry) => entry[0]), ["A", "B"])
+})
+
+it("keep-alive writes while the session is held, then releases it", async () => {
+  const address = "aa:bb:cc:dd:ee:ff"
+  const frames = []
+  const device = createMockDevice(address, {
+    writeImpl(frame) { frames.push(frame.toString("hex")) },
+  })
+  const bus = createMockBus({ devices: new Map([[address, device]]) })
+  const controller = new BleController(
+    { debug() {}, info() {}, warn() {} },
+    controllerOptions({ keepAliveIntervalMs: 40, idleDisconnectMs: 250 }),
+    async () => bus,
+  )
+
+  await controller.send(address, createPowerFrame(true))
+  assert.equal(frames.length, 1)
+
+  const keepAlive = createStatusFrame().toString("hex")
+  const aliveDeadline = Date.now() + 500
+  while (!frames.includes(keepAlive) && Date.now() < aliveDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.ok(frames.includes(keepAlive))
+  assert.equal(await device.isConnected(), true)
+
+  const idleDeadline = Date.now() + 800
+  while (await device.isConnected() && Date.now() < idleDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(await device.isConnected(), false)
+  await controller.stop()
 })

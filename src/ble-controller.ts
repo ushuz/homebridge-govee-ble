@@ -24,6 +24,10 @@ interface BleControllerOptions {
   commandRetries: number
   /** bluez adapter index (hci0 = 0); shared lock is per-adapter */
   hciDeviceId?: number
+  /** ms between keep-alives while a session is held; 0 disables. default 2000 */
+  keepAliveIntervalMs?: number
+  /** ms to hold the link after the last command; 0 keeps it until the peer drops. default 8000 */
+  idleDisconnectMs?: number
 }
 
 const LOCK_OWNER = "govee-ble"
@@ -37,6 +41,8 @@ interface DiscoveredGoveeDevice {
 const DISCONNECT_TIMEOUT = 2000
 const CONNECTION_SETTLE_DELAY = 300
 const RETRY_DELAY = 500
+const DEFAULT_KEEPALIVE_MS = 2000
+const DEFAULT_IDLE_DISCONNECT_MS = 8000
 
 export class BleController {
   private bus: BleBus | undefined
@@ -47,6 +53,10 @@ export class BleController {
   private readonly watched = new WeakSet<NodeBleDevice>()
   /** node-ble connect() already run for this device (listeners installed) */
   private readonly sessionReady = new WeakSet<NodeBleDevice>()
+  private liveAddress: string | undefined
+  private sessionEpoch = 0
+  private keepAliveTimer: NodeJS.Timeout | undefined
+  private idleTimer: NodeJS.Timeout | undefined
 
   constructor(
     private readonly log: Logger,
@@ -73,6 +83,7 @@ export class BleController {
 
   /** disconnect retained sessions and close the dbus bus (homebridge shutdown) */
   async stop(): Promise<void> {
+    this.clearSessionTimers()
     await this.enqueue(async () => {
       for (const [address, device] of [...this.devices.entries()]) {
         this.writeChars.delete(device)
@@ -112,7 +123,8 @@ export class BleController {
   }
 
   private withAdapterLock<T>(operation: () => Promise<T>): Promise<T> {
-    // peer airthings scans are short; dbus property walks happen outside the lock.
+    // the lock covers the whole radio operation, including discovery and
+    // property reads, so a peer plugin cannot connect mid-scan.
     // keep headroom for pi zero contention.
     const acquireTimeoutMs = Math.max(
       180_000,
@@ -163,7 +175,7 @@ export class BleController {
               const name = (await device.getName().catch(() => null))
                 || (await device.getAlias().catch(() => null))
                 || ""
-              if (!/^govee_h61e0(?:_|$)/i.test(name)) {
+              if (!isH61e0Name(name)) {
                 return
               }
               const normalized = normalizeBleAddress(address)
@@ -238,11 +250,12 @@ export class BleController {
 
     this.log.debug("sending BLE frame to %s: %s", address, frame.toString("hex"))
     await withTimeout(
-      characteristic.writeValueWithoutResponse(frame),
+      this.writeCommand(characteristic, frame),
       5000,
       `timed out writing to ${address}`,
     )
     await delay(100)
+    this.touchSession(address)
   }
 
   private forgetDevice(address: string, device?: NodeBleDevice): void {
@@ -315,6 +328,7 @@ export class BleController {
 
     const packet = await this.queryNotify(write, notify, createStatusFrame())
     const parsed = packet ? parseStatusPacket(packet) : null
+    this.touchSession(address)
     return parsed ? parsed.on : null
   }
 
@@ -407,69 +421,184 @@ export class BleController {
     device.on("disconnect", () => {
       this.writeChars.delete(device)
       this.notifyChars.delete(device)
+      this.sessionReady.delete(device)
       // drop cache so the next command fetches a fresh Device and avoids
       // stacking node-ble PropertiesChanged listeners across reconnects
       if (this.devices.get(address) === device) {
         this.devices.delete(address)
+      }
+      if (this.liveAddress === address) {
+        this.clearSessionTimers()
       }
       this.log.debug("BLE device %s disconnected", address)
     })
   }
 
   private async ensureConnected(device: NodeBleDevice, address: string): Promise<void> {
-    // bluez prefers discovery off before connect
+    // bluez on pi zero drops or ignores writes while discovery is running.
+    // leave discovery off after the command; the next scan starts it again.
     const { adapter } = await this.ensureBus()
-    const wasDiscovering = await adapter.isDiscovering()
-    if (wasDiscovering) {
-      try { await adapter.stopDiscovery() } catch { /* ignore */ }
+    if (await adapter.isDiscovering()) {
+      try {
+        await adapter.stopDiscovery()
+      } catch (error) {
+        this.log.debug("could not stop discovery before connect: %s", errorMessage(error))
+      }
+    }
+
+    if (await isConnected(device)) {
+      // leftover bluez session: call connect() once so node-ble installs
+      // disconnect listeners; skip on later commands to avoid stacking them.
+      if (!this.sessionReady.has(device)) {
+        this.writeChars.delete(device)
+        this.notifyChars.delete(device)
+        try {
+          await withTimeout(
+            device.connect(),
+            this.options.connectTimeout,
+            `timed out reconnecting to ${address}`,
+          )
+        } catch {
+          // some bluez versions error when already connected — keep going
+        }
+        this.sessionReady.add(device)
+      }
+      return
+    }
+
+    // the link is down. a missed disconnect event would otherwise reuse the
+    // previous characteristic and the write would succeed locally and vanish.
+    this.writeChars.delete(device)
+    this.notifyChars.delete(device)
+    this.sessionReady.delete(device)
+
+    try {
+      await withTimeout(
+        device.connect(),
+        this.options.connectTimeout,
+        `timed out connecting to ${address}`,
+      )
+    } catch (err) {
+      // cancel in-progress bluez Connect so retries do not see InProgress
+      try { await device.disconnect() } catch { /* ignore */ }
+      throw err
+    }
+    await delay(CONNECTION_SETTLE_DELAY)
+    if (!(await isConnected(device))) {
+      throw new Error(`Govee strip ${address} disconnected while establishing the BLE session`)
+    }
+    this.sessionReady.add(device)
+  }
+
+  /** refresh keep-alive and idle timers after a command that reached the strip */
+  private touchSession(address: string): void {
+    this.liveAddress = address
+    this.armKeepAlive()
+    this.armIdle()
+  }
+
+  private armKeepAlive(): void {
+    const interval = this.options.keepAliveIntervalMs ?? DEFAULT_KEEPALIVE_MS
+    if (interval <= 0 || this.keepAliveTimer) {
+      return
+    }
+    this.keepAliveTimer = setInterval(() => {
+      void this.pumpKeepAlive()
+    }, interval)
+    this.keepAliveTimer.unref?.()
+  }
+
+  private armIdle(): void {
+    const idleMs = this.options.idleDisconnectMs ?? DEFAULT_IDLE_DISCONNECT_MS
+    this.sessionEpoch += 1
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = undefined
+    }
+    if (idleMs <= 0) {
+      return
+    }
+    const epoch = this.sessionEpoch
+    this.idleTimer = setTimeout(() => {
+      void this.disconnectIfIdle(epoch)
+    }, idleMs)
+    this.idleTimer.unref?.()
+  }
+
+  private async pumpKeepAlive(): Promise<void> {
+    const address = this.liveAddress
+    if (!address) {
+      return
     }
     try {
-      if (await isConnected(device)) {
-        // leftover bluez session: call connect() once so node-ble installs
-        // disconnect listeners; skip on later commands to avoid stacking them.
-        if (!this.sessionReady.has(device)) {
-          this.writeChars.delete(device)
-          try {
-            await withTimeout(
-              device.connect(),
-              this.options.connectTimeout,
-              `timed out reconnecting to ${address}`,
-            )
-          } catch {
-            // some bluez versions error when already connected — keep going
-          }
-          this.sessionReady.add(device)
+      await this.withAdapterLock(async () => {
+        if (this.liveAddress !== address) {
+          return
         }
-        return
-      }
-
-      try {
+        const device = this.devices.get(address)
+        if (!device || !(await isConnected(device))) {
+          return
+        }
+        const characteristic = this.writeChars.get(device)
+        if (!characteristic) {
+          return
+        }
+        // same 0xaa 0x01 frame as createStatusFrame — the app's keep-alive
         await withTimeout(
-          device.connect(),
-          this.options.connectTimeout,
-          `timed out connecting to ${address}`,
+          this.writeCommand(characteristic, createStatusFrame()),
+          5000,
+          `timed out sending keep-alive to ${address}`,
         )
-      } catch (err) {
-        // cancel in-progress bluez Connect so retries do not see InProgress
-        try { await device.disconnect() } catch { /* ignore */ }
-        throw err
-      }
-      await delay(CONNECTION_SETTLE_DELAY)
-      if (!(await isConnected(device))) {
-        throw new Error(`Govee strip ${address} disconnected while establishing the BLE session`)
-      }
-      this.sessionReady.add(device)
-    } finally {
-      if (wasDiscovering) {
-        try {
-          if (!(await adapter.isDiscovering())) {
-            await adapter.startDiscovery()
-          }
-        } catch {
-          // ignore
-        }
-      }
+        this.log.debug("sent BLE keep-alive to %s", address)
+      })
+    } catch (error) {
+      this.log.debug("BLE keep-alive to %s failed: %s", address, errorMessage(error))
     }
+  }
+
+  private async disconnectIfIdle(epoch: number): Promise<void> {
+    if (epoch !== this.sessionEpoch) {
+      return
+    }
+    const address = this.liveAddress
+    if (!address) {
+      return
+    }
+    try {
+      await this.withAdapterLock(async () => {
+        if (epoch !== this.sessionEpoch || this.liveAddress !== address) {
+          return
+        }
+        const device = this.devices.get(address)
+        this.clearSessionTimers()
+        if (device) {
+          await this.resetDevice(device)
+        }
+        this.log.debug("released idle BLE session %s", address)
+      })
+    } catch (error) {
+      this.log.debug("idle disconnect failed: %s", errorMessage(error))
+    }
+  }
+
+  private clearSessionTimers(): void {
+    this.sessionEpoch += 1
+    this.liveAddress = undefined
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer)
+      this.keepAliveTimer = undefined
+    }
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = undefined
+    }
+  }
+
+  private async writeCommand(
+    characteristic: NodeBleGattCharacteristic,
+    frame: Buffer,
+  ): Promise<void> {
+    await characteristic.writeValueWithoutResponse(frame)
   }
 
   private async resetDevice(device?: NodeBleDevice): Promise<void> {
@@ -484,6 +613,9 @@ export class BleController {
       }
     }
     if (address) {
+      if (this.liveAddress === address) {
+        this.clearSessionTimers()
+      }
       this.forgetDevice(address, device)
     } else {
       this.writeChars.delete(device)
@@ -498,6 +630,11 @@ export class BleController {
       "timed out disconnecting",
     ).catch(error => this.log.debug("BLE connection reset failed: %s", errorMessage(error)))
   }
+}
+
+/** Govee still advertises the pre-rebrand ihoment_ prefix as well as Govee_. */
+export function isH61e0Name(name: string): boolean {
+  return /h61e0/i.test(name)
 }
 
 async function isConnected(device: NodeBleDevice): Promise<boolean> {

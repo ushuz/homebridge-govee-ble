@@ -30,7 +30,12 @@ export function createPowerFrame(on: boolean): Buffer {
   return createFrame(Command.power, on ? 0x01 : 0x00)
 }
 
-/** 0xaa query — device replies on the notify characteristic (0xee / 0xaa) */
+/**
+ * Keep-alive the Govee app writes about every 2 seconds (0xaa 0x01 … xor).
+ * Some firmware also notifies power on the indicate characteristic; that
+ * reply is what parseStatusPacket reads. A session that stays open without
+ * this frame is dropped or ignores later commands.
+ */
 export function createStatusFrame(): Buffer {
   const frame = Buffer.alloc(PACKET_SIZE)
   frame[0] = 0xaa
