@@ -74,6 +74,8 @@ export interface BleBus {
   adapter: NodeBleAdapter
   adapterName: string
   destroy(): void
+  /** true after dbus refuses further match rules on this connection */
+  isPoisoned?(): boolean
 }
 
 /** injectable factory for tests */
@@ -87,7 +89,11 @@ const Device = require("node-ble/src/Device") as new (
 ) => NodeBleDevice
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const BusHelper = require("node-ble/src/BusHelper") as {
-  prototype: { children: () => Promise<string[]>, _prepare: () => Promise<void> }
+  prototype: {
+    children: () => Promise<string[]>
+    _prepare: () => Promise<void>
+    removeListeners: () => void
+  }
   buildChildren: (path: string, nodes: string[]) => string[]
 }
 
@@ -96,12 +102,19 @@ let busHelperPatched = false
 /** open dbus connection and bind the configured hciN adapter (no silent fallback) */
 export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
   const { bluetooth, destroy } = nodeBle.createBluetooth()
-  // node-ble does not handle dbus 'error'; unhandled emitters crash the process
+  installNodeBlePatches()
+  // node-ble does not handle dbus 'error'; unhandled emitters crash the process.
+  // destroying here would drop the in-flight adapter lock, so the next command
+  // reopens the bus once match rules are exhausted.
+  let poisoned = false
   const dbus = (bluetooth as { dbus?: { on?: (event: string, cb: (err: Error) => void) => void } }).dbus
   if (dbus?.on) {
     dbus.on("error", (err: Error) => {
-      // do not destroy() — that orphans an in-flight adapter lock
-      process.stderr.write(`[node-ble] dbus error: ${err?.message || err}\n`)
+      const message = err?.message || String(err)
+      process.stderr.write(`[node-ble] dbus error: ${message}\n`)
+      if (/match rules/i.test(message)) {
+        poisoned = true
+      }
     })
   }
   try {
@@ -117,10 +130,13 @@ export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
     if (!(await adapter.isPowered())) {
       throw new Error(`bluetooth adapter ${preferred} is not powered`)
     }
-    patchBusHelperChildren()
-    patchGattServerInit()
     patchAdapterDeviceCache(adapter)
-    return { adapter, adapterName: preferred, destroy }
+    return {
+      adapter,
+      adapterName: preferred,
+      destroy,
+      isPoisoned: () => poisoned,
+    }
   } catch (err) {
     try {
       destroy()
@@ -131,14 +147,88 @@ export async function openBleBus(hciDeviceId = 0): Promise<BleBus> {
   }
 }
 
+/** apply the node-ble / dbus-next patches once. safe to call from tests. */
+export function installNodeBlePatches(): void {
+  patchDbusMatchRefcount()
+  patchBusHelperChildren()
+  patchGattServerInit()
+}
+
 /**
  * node-ble BusHelper.children() rebuilds a dbus-next ProxyObject every call.
  * each new proxy adds AddMatch rules until dbus hits max_match_rules (2048).
  * reuse the existing proxy and refresh the child list via introspect.
  */
+/**
+ * dbus-next 0.10 checks `hasOwnProperty` with the rule and the map swapped,
+ * so every _addMatch sends AddMatch and _removeMatch never sends RemoveMatch.
+ * BlueZ counts each AddMatch toward max_match_rules_per_connection.
+ */
+function patchDbusMatchRefcount(): void {
+  if (matchRulesPatched) {
+    return
+  }
+  matchRulesPatched = true
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const MessageBus = require("dbus-next/lib/bus") as {
+    prototype: {
+      _addMatch: (this: MatchBus, match: string) => Promise<unknown>
+      _removeMatch: (this: MatchBus, match: string) => Promise<unknown>
+    }
+  }
+  const origAdd = MessageBus.prototype._addMatch
+  MessageBus.prototype._addMatch = function addMatchRefcounted(this: MatchBus, match: string) {
+    if (Object.prototype.hasOwnProperty.call(this._matchRules, match)) {
+      this._matchRules[match] += 1
+      return Promise.resolve()
+    }
+    return origAdd.call(this, match)
+  }
+  MessageBus.prototype._removeMatch = function removeMatchRefcounted(this: MatchBus, match: string) {
+    if (!this._connection?.stream?.writable) {
+      return Promise.resolve()
+    }
+    if (!Object.prototype.hasOwnProperty.call(this._matchRules, match)) {
+      return Promise.resolve()
+    }
+    this._matchRules[match] -= 1
+    if (this._matchRules[match] > 0) {
+      return Promise.resolve()
+    }
+    delete this._matchRules[match]
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Message } = require("dbus-next/lib/message-type") as {
+      Message: new (options: Record<string, unknown>) => unknown
+    }
+    return this.call(new Message({
+      path: "/org/freedesktop/DBus",
+      destination: "org.freedesktop.DBus",
+      interface: "org.freedesktop.DBus",
+      member: "RemoveMatch",
+      signature: "s",
+      body: [match],
+    }))
+  }
+}
+
+interface MatchBus {
+  _matchRules: Record<string, number>
+  _connection?: { stream?: { writable?: boolean } }
+  call: (message: unknown) => Promise<unknown>
+}
+
+let matchRulesPatched = false
+
 function patchBusHelperChildren(): void {
   if (busHelperPatched) {
     return
+  }
+  BusHelper.prototype.removeListeners = function removeListenersKeepProxy(this: {
+    removeAllListeners: (event?: string) => void
+  }): void {
+    // keep the Properties proxy. dropping it (_ready = false) makes the next
+    // call build a new proxy, which AddMatch'es again.
+    this.removeAllListeners("PropertiesChanged")
   }
   BusHelper.prototype.children = async function childrenReuseProxy(this: {
     _ready?: boolean
@@ -231,11 +321,134 @@ function patchAdapterDeviceCache(adapter: NodeBleAdapter): void {
   }
 }
 
+interface DeviceCache {
+  __deviceCache?: Map<string, NodeBleDevice>
+}
+
+function deviceCache(adapter: NodeBleAdapter): Map<string, NodeBleDevice> | undefined {
+  return (adapter as NodeBleAdapter & DeviceCache).__deviceCache
+}
+
 export function forgetCachedDevice(adapter: NodeBleAdapter, address: string): void {
-  const cache = (adapter as NodeBleAdapter & {
-    __deviceCache?: Map<string, NodeBleDevice>
-  }).__deviceCache
-  cache?.delete(formatBleAddress(address))
+  const cache = deviceCache(adapter)
+  if (!cache) {
+    return
+  }
+  const formatted = formatBleAddress(address)
+  const device = cache.get(formatted)
+  if (!device) {
+    return
+  }
+  cache.delete(formatted)
+  releaseDevice(device)
+}
+
+/** drop every cached device except `keep` (uppercase addresses) and release its match rules */
+export function releaseCachedDevicesExcept(
+  adapter: NodeBleAdapter,
+  keep: ReadonlySet<string>,
+): void {
+  const cache = deviceCache(adapter)
+  if (!cache) {
+    return
+  }
+  for (const [address, device] of [...cache.entries()]) {
+    if (keep.has(address)) {
+      continue
+    }
+    cache.delete(address)
+    releaseDevice(device)
+  }
+}
+
+/**
+ * drop dbus listeners for a device and its GATT tree.
+ * idempotent. call when the handle will not be used again.
+ */
+export function releaseDevice(device: NodeBleDevice | undefined): void {
+  if (!device) {
+    return
+  }
+  const anyDevice = device as NodeBleDevice & {
+    __released?: boolean
+    __gattServer?: unknown
+    helper?: unknown
+    removeAllListeners?: () => void
+  }
+  if (anyDevice.__released) {
+    return
+  }
+  anyDevice.__released = true
+  releaseGattTree(anyDevice.__gattServer)
+  anyDevice.__gattServer = undefined
+  try {
+    anyDevice.removeAllListeners?.()
+  } catch {
+    // ignore
+  }
+  releaseBusHelper(anyDevice.helper)
+}
+
+function releaseGattTree(gatt: unknown): void {
+  if (!gatt || typeof gatt !== "object") {
+    return
+  }
+  const server = gatt as {
+    helper?: unknown
+    _services?: Record<string, {
+      helper?: unknown
+      _characteristics?: Record<string, { helper?: unknown, removeAllListeners?: () => void }>
+    }>
+  }
+  for (const service of Object.values(server._services ?? {})) {
+    for (const characteristic of Object.values(service._characteristics ?? {})) {
+      try {
+        characteristic.removeAllListeners?.()
+      } catch {
+        // ignore
+      }
+      releaseBusHelper(characteristic.helper)
+    }
+    releaseBusHelper(service.helper)
+  }
+  releaseBusHelper(server.helper)
+}
+
+function releaseBusHelper(helper: unknown): void {
+  if (!helper || typeof helper !== "object") {
+    return
+  }
+  const bus = helper as {
+    _ready?: boolean
+    _released?: boolean
+    _propsProxy?: { removeAllListeners?: (event?: string) => void } | null
+    _ifaceProxy?: { removeAllListeners?: () => void } | null
+    _objectProxy?: unknown
+    removeAllListeners?: (event?: string) => void
+  }
+  if (bus._released) {
+    return
+  }
+  bus._released = true
+  try {
+    bus.removeAllListeners?.("PropertiesChanged")
+  } catch {
+    // ignore
+  }
+  try {
+    bus._propsProxy?.removeAllListeners?.("PropertiesChanged")
+  } catch {
+    // ignore
+  }
+  try {
+    bus._ifaceProxy?.removeAllListeners?.()
+  } catch {
+    // ignore
+  }
+  bus._propsProxy = null
+  bus._ifaceProxy = null
+  bus._objectProxy = null
+  bus._ready = false
 }
 
 export function isMissingBluezInterface(error: unknown): boolean {
@@ -254,6 +467,7 @@ export function hardenDevice(device: NodeBleDevice): NodeBleDevice {
   const anyDevice = device as NodeBleDevice & {
     __hardened?: boolean
     __watchInstalled?: boolean
+    __gattServer?: unknown
     emit?: (event: "connect" | "disconnect", payload: { connected: boolean }) => void
     helper?: {
       removeListeners?: () => void
@@ -274,19 +488,25 @@ export function hardenDevice(device: NodeBleDevice): NodeBleDevice {
   const origGatt = device.gatt.bind(device)
   let gattCached: NodeBleGattServer | undefined
   const dropGatt = () => {
+    const previous = gattCached
     gattCached = undefined
+    anyDevice.__gattServer = undefined
+    releaseGattTree(previous)
   }
   device.connect = async () => {
     const connected = await isDeviceConnected(device)
     if (!connected) {
       dropGatt()
-      try {
-        anyDevice.helper?.removeAllListeners?.("PropertiesChanged")
-      } catch {
-        // ignore
-      }
+      clearHelperUserListeners(anyDevice)
       anyDevice.__watchInstalled = false
-      await origConnect()
+      try {
+        await origConnect()
+      } catch (err) {
+        // node-ble connect() arms PropertiesChanged before Connect returns.
+        // a failed attempt must not leave that listener in place.
+        clearHelperUserListeners(anyDevice)
+        throw err
+      }
       return
     }
     installConnectedWatch(anyDevice, dropGatt)
@@ -296,6 +516,7 @@ export function hardenDevice(device: NodeBleDevice): NodeBleDevice {
       await origDisconnect()
     } finally {
       dropGatt()
+      anyDevice.__watchInstalled = false
       try {
         anyDevice.helper?.removeListeners?.()
       } catch {
@@ -312,14 +533,29 @@ export function hardenDevice(device: NodeBleDevice): NodeBleDevice {
           return gattCached
         }
       } catch {
-        gattCached = undefined
+        // stale server; fall through and rebuild
       }
+      dropGatt()
     }
-    gattCached = await origGatt()
-    return gattCached
+    const next = await origGatt()
+    gattCached = next
+    anyDevice.__gattServer = next
+    return next
   }
 
   return device
+}
+
+function clearHelperUserListeners(device: {
+  helper?: { removeAllListeners?: (event: string) => void }
+}): void {
+  try {
+    // user listeners live on the BusHelper. the proxy forwarder stays so the
+    // match rule is not removed and added again on the next connect.
+    device.helper?.removeAllListeners?.("PropertiesChanged")
+  } catch {
+    // ignore
+  }
 }
 
 function installConnectedWatch(
@@ -517,8 +753,10 @@ export async function waitForTruthyProperty(
  * PropertiesChanged with no timeout. If the property flips true before that
  * listener is armed, init never returns and every command times out.
  */
-export function patchGattServerInit(timeoutMs = GATT_RESOLVE_TIMEOUT_MS): void {
-  gattResolveTimeoutMs = timeoutMs
+export function patchGattServerInit(timeoutMs?: number): void {
+  if (timeoutMs !== undefined) {
+    gattResolveTimeoutMs = timeoutMs
+  }
   if (gattServerPatched) {
     return
   }
@@ -603,48 +841,95 @@ interface GattServerLike {
 
 /**
  * ensure le discovery is running.
- * bluez discovery is owned by the dbus client that started it. try stop (only
- * works if we own the session), then start; on "already in progress" piggyback.
- * if start still fails, power-cycle the adapter to clear a stuck session.
- * returns whether this call started discovery (caller should stop only if true).
+ * bluez discovery is owned by the dbus sender that started it, not by the
+ * Discovering property. node-ble refuses to StopDiscovery unless that
+ * property is already true, so a session can stay registered (next
+ * StartDiscovery returns InProgress) and, on BlueZ 5.66, leave Discovering
+ * stuck with no Device1 objects.
+ * returns whether this call owns a session the caller must stop.
  */
-export async function ensureDiscovery(adapter: NodeBleAdapter): Promise<boolean> {
-  try {
-    if (await adapter.isDiscovering()) {
-      try {
-        await adapter.stopDiscovery()
-        await sleep(150)
-      } catch {
-        // another client owns the session — piggyback below
+const DISCOVERY_RPC_TIMEOUT_MS = 8_000
+
+export async function ensureDiscovery(
+  adapter: NodeBleAdapter,
+  rpcTimeoutMs = DISCOVERY_RPC_TIMEOUT_MS,
+): Promise<boolean> {
+  if (isDiscoveryOwned(adapter)) {
+    await stopOwnedDiscovery(adapter, rpcTimeoutMs, true)
+  }
+
+  if (await readDiscovering(adapter)) {
+    const stopped = await tryStopDiscovery(adapter, rpcTimeoutMs)
+    if (stopped === "absent") {
+      // this connection has no session. an empty device list with the flag
+      // stuck on is the BlueZ 5.66 wedge (kernel scan dead, no client left).
+      // another client's scan that has already found devices is left alone.
+      if (!(await adapterHasNoDevices(adapter))) {
+        return false
       }
-    }
-  } catch {
-    // ignore property read errors
-  }
-
-  if (await adapter.isDiscovering().catch(() => false)) {
-    return false
-  }
-
-  try {
-    await adapter.startDiscovery()
-    return true
-  } catch (err) {
-    // BlueZ reports this as org.bluez.Error.InProgress ("InProgress") or
-    // "Operation already in progress". Power-cycling here drops every other
-    // connection on the adapter, including a peer plugin's session.
-    if (isDiscoveryBusyError(err)) {
-      return false
-    }
-    try {
-      const msg = String((err as Error)?.message || err)
       process.stderr.write(
-        `[govee-ble] power-cycling bluetooth adapter after discovery error: ${msg}\n`,
+        "[govee-ble] bluetooth discovery is on but no devices are present; power-cycling adapter\n",
       )
       await powerCycleAdapter(adapter)
-      await adapter.startDiscovery()
+    } else if (stopped !== "stopped") {
+      await stopOwnedDiscovery(adapter, rpcTimeoutMs, isDiscoveryOwned(adapter))
+      if (await readDiscovering(adapter)) {
+        return false
+      }
+    } else {
+      // the method reply can land before the Discovering property flips
+      await sleep(150)
+      if (await readDiscovering(adapter)) {
+        return false
+      }
+    }
+  }
+
+  return startDiscoveryOwned(adapter, rpcTimeoutMs)
+}
+
+async function startDiscoveryOwned(
+  adapter: NodeBleAdapter,
+  rpcTimeoutMs: number,
+): Promise<boolean> {
+  markDiscoveryOwned(adapter, true)
+  try {
+    await startDiscoverySession(adapter, rpcTimeoutMs)
+    return true
+  } catch (err) {
+    // InProgress means THIS sender already has a discovery client. that is
+    // our leaked session, not a peer. stop it and start once more. do not
+    // power-cycle: a peer plugin may be connected on the same adapter.
+    if (isDiscoveryBusyError(err)) {
+      const stopped = await tryStopDiscovery(adapter, rpcTimeoutMs)
+      if (stopped === "busy" || stopped === "failed") {
+        await stopOwnedDiscovery(adapter, rpcTimeoutMs, true)
+      }
+      try {
+        markDiscoveryOwned(adapter, true)
+        await startDiscoverySession(adapter, rpcTimeoutMs)
+        return true
+      } catch (retryErr) {
+        if (isDiscoveryBusyError(retryErr)) {
+          markDiscoveryOwned(adapter, true)
+          return true
+        }
+        await stopOwnedDiscovery(adapter, rpcTimeoutMs, true)
+        throw retryErr
+      }
+    }
+
+    try {
+      await stopOwnedDiscovery(adapter, rpcTimeoutMs, true)
+      process.stderr.write(
+        `[govee-ble] power-cycling bluetooth adapter after discovery error: ${errorText(err)}\n`,
+      )
+      await powerCycleAdapter(adapter)
+      markDiscoveryOwned(adapter, true)
+      await startDiscoverySession(adapter, rpcTimeoutMs)
       return true
     } catch {
+      await stopOwnedDiscovery(adapter, rpcTimeoutMs, true)
       throw err
     }
   }
@@ -652,17 +937,196 @@ export async function ensureDiscovery(adapter: NodeBleAdapter): Promise<boolean>
 
 /** true when startDiscovery failed because a discovery session already exists */
 export function isDiscoveryBusyError(error: unknown): boolean {
+  return /already in progress|inprogress/i.test(errorText(error))
+}
+
+function errorText(error: unknown): string {
   const typed = error as { message?: string, type?: string }
-  const text = `${typed?.type || ""} ${typed?.message || error}`
-  return /already in progress|inprogress/i.test(text)
+  return `${typed?.type || ""} ${typed?.message || error}`
+}
+
+type StopResult = "stopped" | "absent" | "busy" | "failed"
+
+/**
+ * stop a discovery session this connection owns.
+ * bypasses node-ble's Discovering guard, which skips the BlueZ call when the
+ * property has not flipped yet and therefore leaks the client.
+ */
+async function tryStopDiscovery(
+  adapter: NodeBleAdapter,
+  rpcTimeoutMs: number,
+): Promise<StopResult> {
+  try {
+    await withTimeout(
+      callAdapterMethod(adapter, "StopDiscovery"),
+      rpcTimeoutMs,
+      "timed out stopping discovery",
+    )
+    return "stopped"
+  } catch (err) {
+    if (/no discovery started/i.test(errorText(err))) {
+      return "absent"
+    }
+    if (isDiscoveryBusyError(err)) {
+      return "busy"
+    }
+    return "failed"
+  }
+}
+
+async function stopOwnedDiscovery(
+  adapter: NodeBleAdapter,
+  rpcTimeoutMs: number,
+  powerCycle: boolean,
+): Promise<void> {
+  const ownedAtStart = isDiscoveryOwned(adapter)
+  let sawBusy = false
+  let last: StopResult = "failed"
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    last = await tryStopDiscovery(adapter, rpcTimeoutMs)
+    if (last === "busy") {
+      sawBusy = true
+    }
+    if (last === "stopped") {
+      markDiscoveryOwned(adapter, false)
+      return
+    }
+    if (last === "absent") {
+      markDiscoveryOwned(adapter, false)
+      // BlueZ 5.66 can remove the client and still leave Discovering true
+      // when the kernel rejects the stop. that only happens for the last
+      // client, and the dbus reply is InProgress before the client is gone.
+      if (powerCycle && ownedAtStart && sawBusy && await readDiscovering(adapter)) {
+        process.stderr.write(
+          "[govee-ble] power-cycling bluetooth adapter to clear stuck discovery\n",
+        )
+        await powerCycleAdapter(adapter)
+      }
+      return
+    }
+    if (last === "failed") {
+      break
+    }
+    await sleep(200)
+  }
+  markDiscoveryOwned(adapter, false)
+  if (powerCycle && ownedAtStart && await readDiscovering(adapter)) {
+    process.stderr.write(
+      "[govee-ble] power-cycling bluetooth adapter to clear stuck discovery\n",
+    )
+    await powerCycleAdapter(adapter)
+  }
+}
+
+async function startDiscoverySession(
+  adapter: NodeBleAdapter,
+  rpcTimeoutMs: number,
+): Promise<void> {
+  await withTimeout((async () => {
+    const helper = adapterHelper(adapter)
+    if (helper?.callMethod) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const buildTypedValue = require("node-ble/src/buildTypedValue") as (
+          type: string,
+          value: string,
+        ) => unknown
+        await helper.callMethod("SetDiscoveryFilter", {
+          Transport: buildTypedValue("string", "le"),
+        })
+      } catch (err) {
+        process.stderr.write(
+          `[govee-ble] discovery filter failed: ${errorText(err)}\n`,
+        )
+      }
+      await helper.callMethod("StartDiscovery")
+      return
+    }
+    await adapter.startDiscovery()
+  })(), rpcTimeoutMs, "timed out starting discovery")
+}
+
+async function callAdapterMethod(adapter: NodeBleAdapter, method: "StopDiscovery"): Promise<void> {
+  const helper = adapterHelper(adapter)
+  if (helper?.callMethod) {
+    await helper.callMethod(method)
+    return
+  }
+  await adapter.stopDiscovery()
+}
+
+interface AdapterHelper {
+  callMethod?: (method: string, ...args: unknown[]) => Promise<unknown>
+  set?: (prop: string, value: unknown) => Promise<void>
+}
+
+function adapterHelper(adapter: NodeBleAdapter): AdapterHelper | undefined {
+  return (adapter as NodeBleAdapter & { helper?: AdapterHelper }).helper
+}
+
+function isDiscoveryOwned(adapter: NodeBleAdapter): boolean {
+  return (adapter as NodeBleAdapter & { __discoveryOwned?: boolean }).__discoveryOwned === true
+}
+
+function markDiscoveryOwned(adapter: NodeBleAdapter, owned: boolean): void {
+  (adapter as NodeBleAdapter & { __discoveryOwned?: boolean }).__discoveryOwned = owned
+}
+
+async function readDiscovering(adapter: NodeBleAdapter): Promise<boolean> {
+  try {
+    return await adapter.isDiscovering()
+  } catch {
+    return false
+  }
+}
+
+async function adapterHasNoDevices(adapter: NodeBleAdapter): Promise<boolean> {
+  try {
+    const listed = await adapter.devices()
+    return listed.length === 0
+  } catch {
+    return false
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  let timedOut = false
+  const guarded = promise.then(
+    (value) => {
+      if (timedOut) {
+        return undefined as T
+      }
+      return value
+    },
+    (error: unknown) => {
+      if (timedOut) {
+        return undefined as T
+      }
+      throw error
+    },
+  )
+  try {
+    return await Promise.race([
+      guarded,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true
+          reject(new Error(message))
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) {
+      clearTimeout(timer)
+    }
+  }
 }
 
 /** power-cycle adapter via node-ble BusHelper (clears stuck Discovering) */
 async function powerCycleAdapter(adapter: NodeBleAdapter): Promise<void> {
-  const anyAdapter = adapter as unknown as {
-    helper?: { set: (prop: string, value: unknown) => Promise<void> }
-  }
-  if (!anyAdapter.helper?.set) {
+  const helper = adapterHelper(adapter)
+  if (!helper?.set) {
     return
   }
   // dbus-next Variant — same shape node-ble buildTypedValue uses
@@ -670,26 +1134,37 @@ async function powerCycleAdapter(adapter: NodeBleAdapter): Promise<void> {
   const { Variant } = require("dbus-next") as {
     Variant: new (sig: string, value: unknown) => unknown
   }
-  await anyAdapter.helper.set("Powered", new Variant("b", false))
+  await helper.set("Powered", new Variant("b", false))
   await sleep(300)
-  await anyAdapter.helper.set("Powered", new Variant("b", true))
+  await helper.set("Powered", new Variant("b", true))
   await sleep(400)
 }
 
 export async function stopDiscoveryIfStarted(
   adapter: NodeBleAdapter,
   startedHere: boolean,
+  rpcTimeoutMs = DISCOVERY_RPC_TIMEOUT_MS,
 ): Promise<void> {
-  if (!startedHere) {
+  if (!startedHere && !isDiscoveryOwned(adapter)) {
     return
   }
   try {
-    if (await adapter.isDiscovering()) {
-      await adapter.stopDiscovery()
-    }
-  } catch {
-    // ignore
+    await stopOwnedDiscovery(adapter, rpcTimeoutMs, true)
+  } catch (err) {
+    process.stderr.write(`[govee-ble] stop discovery failed: ${errorText(err)}\n`)
   }
+}
+
+/**
+ * stop discovery before a connect. a session this process started is stopped
+ * even when the Discovering property has not flipped yet. another client's
+ * scan is left running.
+ */
+export async function stopDiscoveryBeforeConnect(adapter: NodeBleAdapter): Promise<void> {
+  if (!isDiscoveryOwned(adapter) && !(await readDiscovering(adapter))) {
+    return
+  }
+  await stopDiscoveryIfStarted(adapter, true)
 }
 
 /** discover every characteristic under every primary service */

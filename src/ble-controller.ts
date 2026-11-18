@@ -8,6 +8,9 @@ import {
   isMissingBluezInterface,
   normalizeBleAddress,
   openBleBus,
+  releaseCachedDevicesExcept,
+  releaseDevice,
+  stopDiscoveryBeforeConnect,
   stopDiscoveryIfStarted,
   uuidKey,
   type BleBus,
@@ -85,29 +88,33 @@ export class BleController {
   async stop(): Promise<void> {
     this.clearSessionTimers()
     await this.enqueue(async () => {
+      const bus = this.bus
+      this.bus = undefined
       for (const [address, device] of [...this.devices.entries()]) {
-        this.writeChars.delete(device)
-        this.devices.delete(address)
         try {
           await device.disconnect()
         } catch {
           // ignore
         }
+        this.forgetDevice(address, device)
       }
-      if (this.bus) {
+      if (bus) {
         try {
-          if (await this.bus.adapter.isDiscovering()) {
-            await this.bus.adapter.stopDiscovery()
-          }
+          releaseCachedDevicesExcept(bus.adapter, new Set())
         } catch {
           // ignore
         }
         try {
-          this.bus.destroy()
+          // also stops a session whose Discovering property has not flipped yet
+          await stopDiscoveryIfStarted(bus.adapter, true)
         } catch {
           // ignore
         }
-        this.bus = undefined
+        try {
+          bus.destroy()
+        } catch {
+          // ignore
+        }
       }
     }).catch((error) => {
       this.log.debug("ble stop failed: %s", errorMessage(error))
@@ -146,6 +153,10 @@ export class BleController {
   }
 
   private async ensureBus(): Promise<BleBus> {
+    if (this.bus?.isPoisoned?.()) {
+      this.log.warn("reopening bluetooth dbus connection after match-rule failure")
+      await this.discardBus()
+    }
     if (!this.bus) {
       this.bus = await this.openBus(this.options.hciDeviceId ?? 0)
       this.log.debug(
@@ -154,6 +165,38 @@ export class BleController {
       )
     }
     return this.bus
+  }
+
+  /** drop the dbus connection and every device handle tied to it */
+  private async discardBus(): Promise<void> {
+    const bus = this.bus
+    this.bus = undefined
+    this.clearSessionTimers()
+    for (const device of this.devices.values()) {
+      this.writeChars.delete(device)
+      this.notifyChars.delete(device)
+      this.sessionReady.delete(device)
+      releaseDevice(device)
+    }
+    this.devices.clear()
+    if (!bus) {
+      return
+    }
+    try {
+      releaseCachedDevicesExcept(bus.adapter, new Set())
+    } catch {
+      // ignore
+    }
+    try {
+      await stopDiscoveryIfStarted(bus.adapter, true)
+    } catch {
+      // ignore
+    }
+    try {
+      bus.destroy()
+    } catch {
+      // ignore
+    }
   }
 
   private async scanForGoveeDevices(): Promise<void> {
@@ -196,7 +239,14 @@ export class BleController {
           await delay(1000)
         }
       } finally {
-        await stopDiscoveryIfStarted(adapter, startedHere)
+        try {
+          await stopDiscoveryIfStarted(adapter, startedHere)
+        } finally {
+          releaseCachedDevicesExcept(
+            adapter,
+            new Set([...this.devices.keys()].map((address) => formatBleAddress(address))),
+          )
+        }
       }
     })
 
@@ -272,6 +322,10 @@ export class BleController {
     if (this.bus) {
       forgetCachedDevice(this.bus.adapter, address)
     }
+    // the handle may already have left the adapter cache (stale probe).
+    // release is idempotent, so a second call does not drop a live proxy.
+    releaseDevice(device)
+    releaseDevice(cached)
   }
 
   private async probeDevice(device: NodeBleDevice): Promise<void> {
@@ -422,11 +476,9 @@ export class BleController {
       this.writeChars.delete(device)
       this.notifyChars.delete(device)
       this.sessionReady.delete(device)
-      // drop cache so the next command fetches a fresh Device and avoids
-      // stacking node-ble PropertiesChanged listeners across reconnects
-      if (this.devices.get(address) === device) {
-        this.devices.delete(address)
-      }
+      // keep the device handle. a new Device() builds another dbus proxy and
+      // another match rule; the link comes back on the same BlueZ object.
+      // a dead object fails the next probe and is released there.
       if (this.liveAddress === address) {
         this.clearSessionTimers()
       }
@@ -438,12 +490,12 @@ export class BleController {
     // bluez on pi zero drops or ignores writes while discovery is running.
     // leave discovery off after the command; the next scan starts it again.
     const { adapter } = await this.ensureBus()
-    if (await adapter.isDiscovering()) {
-      try {
-        await adapter.stopDiscovery()
-      } catch (error) {
-        this.log.debug("could not stop discovery before connect: %s", errorMessage(error))
-      }
+    // writes on a Pi Zero are dropped while discovery is running. also stop
+    // a session we own whose Discovering property has not flipped yet.
+    try {
+      await stopDiscoveryBeforeConnect(adapter)
+    } catch (error) {
+      this.log.debug("could not stop discovery before connect: %s", errorMessage(error))
     }
 
     if (await isConnected(device)) {
@@ -572,7 +624,9 @@ export class BleController {
         const device = this.devices.get(address)
         this.clearSessionTimers()
         if (device) {
-          await this.resetDevice(device)
+          // drop the link, keep the device handle so the next command does
+          // not allocate a new dbus proxy.
+          await this.resetDevice(device, false)
         }
         this.log.debug("released idle BLE session %s", address)
       })
@@ -601,7 +655,7 @@ export class BleController {
     await characteristic.writeValueWithoutResponse(frame)
   }
 
-  private async resetDevice(device?: NodeBleDevice): Promise<void> {
+  private async resetDevice(device?: NodeBleDevice, releaseHandle = true): Promise<void> {
     if (!device) {
       return
     }
@@ -612,23 +666,27 @@ export class BleController {
         break
       }
     }
-    if (address) {
-      if (this.liveAddress === address) {
-        this.clearSessionTimers()
-      }
-      this.forgetDevice(address, device)
-    } else {
-      this.writeChars.delete(device)
-      this.notifyChars.delete(device)
+    if (address && this.liveAddress === address) {
+      this.clearSessionTimers()
     }
-    if (!(await isConnected(device))) {
+    this.writeChars.delete(device)
+    this.notifyChars.delete(device)
+    this.sessionReady.delete(device)
+    if (await isConnected(device)) {
+      await withTimeout(
+        device.disconnect(),
+        DISCONNECT_TIMEOUT,
+        "timed out disconnecting",
+      ).catch(error => this.log.debug("BLE connection reset failed: %s", errorMessage(error)))
+    }
+    if (!releaseHandle) {
       return
     }
-    await withTimeout(
-      device.disconnect(),
-      DISCONNECT_TIMEOUT,
-      "timed out disconnecting",
-    ).catch(error => this.log.debug("BLE connection reset failed: %s", errorMessage(error)))
+    if (address) {
+      this.forgetDevice(address, device)
+      return
+    }
+    releaseDevice(device)
   }
 }
 
