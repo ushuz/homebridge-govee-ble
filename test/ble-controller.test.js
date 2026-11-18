@@ -394,3 +394,94 @@ it("keep-alive writes while the session is held, then releases it", async () => 
   assert.equal(await device.isConnected(), false)
   await controller.stop()
 })
+
+it("stops discovery when the strip cannot be found", async () => {
+  let session = false
+  const bus = createMockBus()
+  bus.adapter.isDiscovering = async () => session
+  bus.adapter.getDevice = async () => { throw new Error("Device not found") }
+  bus.adapter.waitDevice = async () => { throw new Error("operation timed out") }
+  bus.adapter.helper = {
+    async callMethod(name) {
+      if (name === "SetDiscoveryFilter") return
+      if (name === "StartDiscovery") {
+        session = true
+        return
+      }
+      if (name === "StopDiscovery") {
+        if (!session) throw new Error("No discovery started")
+        session = false
+      }
+    },
+  }
+  const controller = new BleController(
+    { debug() {}, info() {}, warn() {} },
+    controllerOptions({ scanTimeout: 40, commandRetries: 0 }),
+    async () => bus,
+  )
+
+  await assert.rejects(
+    () => controller.send("aa:bb:cc:dd:ee:ff", createPowerFrame(true)),
+    /operation timed out/,
+  )
+  assert.equal(session, false)
+  await controller.stop()
+})
+
+it("reopens the dbus connection after a match-rule failure", async () => {
+  const address = "aa:bb:cc:dd:ee:ff"
+  const device = createMockDevice(address, { writeImpl() {} })
+  let opened = 0
+  const destroyed = []
+  let poisoned = false
+  const controller = new BleController(
+    { debug() {}, info() {}, warn() {} },
+    controllerOptions(),
+    async () => {
+      opened += 1
+      const bus = createMockBus({ devices: new Map([[address, device]]) })
+      const id = opened
+      bus.destroy = () => { destroyed.push(id) }
+      bus.isPoisoned = () => id === 1 && poisoned
+      return bus
+    },
+  )
+
+  await controller.send(address, createPowerFrame(true))
+  assert.equal(opened, 1)
+  poisoned = true
+  await controller.send(address, createPowerFrame(false))
+  assert.equal(opened, 2)
+  assert.deepEqual(destroyed, [1])
+  await controller.stop()
+})
+
+it("reuses the device handle after an idle disconnect", async () => {
+  const address = "aa:bb:cc:dd:ee:ff"
+  let gets = 0
+  const device = createMockDevice(address, { writeImpl() {} })
+  const bus = createMockBus({ devices: new Map([[address, device]]) })
+  const getDevice = bus.adapter.getDevice
+  bus.adapter.getDevice = async (addr) => {
+    gets += 1
+    return getDevice(addr)
+  }
+  const controller = new BleController(
+    { debug() {}, info() {}, warn() {} },
+    controllerOptions({ keepAliveIntervalMs: 0, idleDisconnectMs: 40 }),
+    async () => bus,
+  )
+
+  await controller.send(address, createPowerFrame(true))
+  assert.equal(gets, 1)
+
+  const idleDeadline = Date.now() + 500
+  while (await device.isConnected() && Date.now() < idleDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 15))
+  }
+  assert.equal(await device.isConnected(), false)
+
+  await controller.send(address, createPowerFrame(false))
+  assert.equal(gets, 1)
+  await controller.stop()
+})
